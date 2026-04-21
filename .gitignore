@@ -1,0 +1,53 @@
+# === 机密 ===
+.env
+
+# === Python 编译产物 ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === 构建 / 打包 ===
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# === 虚拟环境 ===
+.venv/
+venv/
+env/
+.conda/
+
+# === macOS 系统文件 ===
+.DS_Store
+**/.DS_Store
+
+# === IDE / 编辑器 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === 测试临时输出 ===
+tests/_smoke_outputs*/
+tests/_visual_smoke_outputs/
+
+# === 运行时输出（旅行计划生成结果）===
+outputs/
+_http_cache/
+_rail_cache/
+
+# === 日志 ===
+*.log
+
+# === Frontend 非必要产物 ===
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/.cache/
+frontend/.eslintcache
+frontend/*.tsbuildinfo

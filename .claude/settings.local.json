@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uvicorn backend.main:app --reload --port 8000)",
+      "Bash(curl -s http://localhost:8000/api/status)",
+      "Bash(python -m uvicorn backend.main:app --reload --port 8000)",
+      "Bash(conda activate:*)",
+      "Bash(conda run:*)",
+      "Bash(npm run:*)",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(npm install:*)",
+      "Bash(pkill -f \"uvicorn backend.main:app\")",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(curl -v http://localhost:8000/api/status)"
+    ]
+  }
+}

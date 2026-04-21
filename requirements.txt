@@ -1,0 +1,8 @@
+streamlit>=1.37
+pandas>=2.2
+requests>=2.32
+python-dotenv>=1.0
+
+# FastAPI backend (前后端分离模式)
+fastapi>=0.111
+uvicorn[standard]>=0.30
