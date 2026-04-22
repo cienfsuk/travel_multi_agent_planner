@@ -178,8 +178,16 @@ export interface BudgetSummary {
   lines: BudgetLine[];
 }
 
+export interface PlanConstraints {
+  preferred_areas?: string[];
+  avoid_tags?: string[];
+  must_include_spots?: string[];
+  must_include_spots_by_day?: Record<string, string[]>;
+}
+
 export interface TripPlan {
   request: TripRequest;
+  constraints?: PlanConstraints;
   days: DayPlan[];
   budget_summary: BudgetSummary;
   warnings: string[];

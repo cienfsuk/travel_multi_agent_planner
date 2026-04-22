@@ -25,7 +25,8 @@ class BailianLLMProvider:
         prompt = (
             "You are a travel planning constraint extractor. "
             "Return only JSON with keys: max_daily_spots, max_daily_transport_transfers, "
-            "max_total_budget, preferred_areas, must_have_tags, avoid_tags, pacing_note."
+            "max_total_budget, preferred_areas, must_have_tags, avoid_tags, "
+            "must_include_spots, must_include_spots_by_day, pacing_note."
         )
         result = self._chat_json(
             system_prompt=prompt,
@@ -41,6 +42,12 @@ class BailianLLMProvider:
                 preferred_areas=list(result.get("preferred_areas", [])),
                 must_have_tags=list(result.get("must_have_tags", [])),
                 avoid_tags=list(result.get("avoid_tags", [])),
+                must_include_spots=list(result.get("must_include_spots", [])),
+                must_include_spots_by_day={
+                    int(day): [str(name) for name in names]
+                    for day, names in (result.get("must_include_spots_by_day", {}) or {}).items()
+                    if isinstance(names, list)
+                },
                 pacing_note=str(result.get("pacing_note", "")),
             )
         except Exception:

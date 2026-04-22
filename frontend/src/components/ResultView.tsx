@@ -11,7 +11,6 @@ import type {
 import {
   translateNoteStyle,
   translateEvidenceType,
-  translateTags,
 } from "../utils/translations";
 import TripMapView, { type TripMapHandle } from "./TripMapView";
 
@@ -106,6 +105,13 @@ function flattenEvidence(plan: PlanResponse["plan"]): EvidenceRow[] {
     }
   }
   return rows;
+}
+
+function normalizeMatchText(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s·・,，。；:：\-_/()（）]+/g, "");
 }
 
 const MAP_DAY_COLORS = [
@@ -264,6 +270,46 @@ export default function ResultView({ result }: Props) {
     ];
   }, [plan.validation_issues, plan.warnings]);
   const riskCount = riskItems.length;
+  const mustHitStatus = useMemo(() => {
+    const required = [
+      ...(plan.constraints?.must_include_spots ?? []),
+      ...Object.values(plan.constraints?.must_include_spots_by_day ?? {}).flat(),
+    ];
+    const dedupedRequired = Array.from(
+      new Map(
+        required
+          .map((name) => name.trim())
+          .filter(Boolean)
+          .map((name) => [normalizeMatchText(name), name]),
+      ).values(),
+    );
+    if (!dedupedRequired.length) {
+      return null;
+    }
+    const spotNames = plan.days.flatMap((day) => day.spots.map((spot) => spot.name));
+    const hits: string[] = [];
+    const missing: string[] = [];
+    for (const requiredName of dedupedRequired) {
+      const requiredNorm = normalizeMatchText(requiredName);
+      const matched = spotNames.find((spotName) => {
+        const spotNorm = normalizeMatchText(spotName);
+        return (
+          spotNorm === requiredNorm ||
+          spotNorm.includes(requiredNorm) ||
+          requiredNorm.includes(spotNorm)
+        );
+      });
+      if (matched) {
+        hits.push(matched);
+      } else {
+        missing.push(requiredName);
+      }
+    }
+    return {
+      hits: Array.from(new Set(hits)),
+      missing,
+    };
+  }, [plan.constraints, plan.days]);
 
   useEffect(() => {
     setEvidencePage(1);
@@ -400,9 +446,25 @@ export default function ResultView({ result }: Props) {
                         </span>
                       )}
                     </div>
-                    {!!plan.search_notes?.length && (
+                    {(mustHitStatus || !!plan.search_notes?.length) && (
                       <div className="rounded-xl bg-slate-50 p-3 text-xs dark:bg-slate-900/40">
-                        {plan.search_notes.slice(0, 3).map((note, idx) => (
+                        {mustHitStatus && (
+                          <div className="space-y-1 pb-1">
+                            <div>
+                              - 必达景点已命中：
+                              {mustHitStatus.hits.length
+                                ? mustHitStatus.hits.join("、")
+                                : "无"}
+                              。
+                            </div>
+                            {mustHitStatus.missing.length > 0 && (
+                              <div className="text-amber-600 dark:text-amber-400">
+                                - 仍未命中：{mustHitStatus.missing.join("、")}。
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {(plan.search_notes ?? []).slice(0, 5).map((note, idx) => (
                           <div key={idx}>- {note}</div>
                         ))}
                       </div>

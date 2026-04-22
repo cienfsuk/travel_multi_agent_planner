@@ -106,14 +106,16 @@ class TravelPlanningOrchestrator:
         )
 
         profile, origin_match, destination_match, provider_notes = self.search_agent.build_city_profile(request, self.search_provider)
+        profile.pois, required_notes = self.search_agent.ensure_required_spots(profile, constraints, self.search_provider)
         profile.pois = self.search_agent.rank_pois(profile.pois, request, constraints)
+        search_notes.extend(required_notes)
         search_notes.extend(provider_notes)
         _emit(
             AgentTraceStep(
                 agent_name="Search Agent",
                 input_summary=f"确认城市：{request.origin} / {request.destination}",
                 output_summary=f"已确认 {origin_match.confirmed_name} -> {destination_match.confirmed_name}，并检索景点 {len(profile.pois)} 个、餐饮 {len(profile.foods)} 个、酒店 {len(profile.hotels)} 个",
-                key_decisions=provider_notes[:3] or [f"目标城市标准化为 {destination_match.confirmed_name}"],
+                key_decisions=(required_notes + provider_notes)[:3] or [f"目标城市标准化为 {destination_match.confirmed_name}"],
             )
         )
 
@@ -285,10 +287,11 @@ class TravelPlanningOrchestrator:
         draft_plan: list[dict],
     ) -> tuple[list[DayPlan], list[RoutePoint], list[str]]:
         notes: list[str] = []
+        hotel_candidates = self._prepare_hotel_candidates(request, profile)
         hotel_input, hotel_notes = self.hotel_agent.attach_hotels(
             request,
             deepcopy(draft_plan),
-            profile.hotels,
+            hotel_candidates,
             self.llm_provider if self.llm_provider.is_available() else None,
         )
         notes.extend(hotel_notes)
@@ -300,14 +303,36 @@ class TravelPlanningOrchestrator:
         for daily in hotel_input:
             hotel = daily.get("hotel")
             if hotel is None:
-                raise RuntimeError(f"第 {daily['day']} 天未找到可靠酒店候选，无法生成方案。")
-            daily["spots"] = self.map_provider.reorder_spots({"lat": hotel.lat, "lon": hotel.lon}, daily["spots"])
+                if hotel_candidates:
+                    hotel = hotel_candidates[0]
+                    notes.append(f"第 {daily['day']} 天酒店偏好未命中，已降级使用 {hotel.name} 继续规划。")
+                else:
+                    notes.append(f"第 {daily['day']} 天未检索到可用酒店，已按无酒店模式继续规划。")
+            if daily["spots"]:
+                if hotel is not None:
+                    anchor_lat, anchor_lon = hotel.lat, hotel.lon
+                else:
+                    anchor_lat, anchor_lon = daily["spots"][0].lat, daily["spots"][0].lon
+                daily["spots"] = self.map_provider.reorder_spots({"lat": anchor_lat, "lon": anchor_lon}, daily["spots"])
             arrival_segment = None
             departure_segment = None
+            stay_anchor = hotel.name if hotel is not None else (daily["spots"][0].name if daily["spots"] else f"{profile.city} 市区")
             if daily["day"] == 1:
-                arrival_segment = self.transport.infer_intercity_segment(request, profile, f"{request.origin} 出发", hotel.name, leg="outbound")
+                arrival_segment = self.transport.infer_intercity_segment(
+                    request,
+                    profile,
+                    f"{request.origin} 出发",
+                    stay_anchor,
+                    leg="outbound",
+                )
             if daily["day"] == request.days:
-                departure_segment = self.transport.infer_intercity_segment(request, profile, hotel.name, f"{request.origin} 返程", leg="return")
+                departure_segment = self.transport.infer_intercity_segment(
+                    request,
+                    profile,
+                    stay_anchor,
+                    f"{request.origin} 返程",
+                    leg="return",
+                )
             daily["spots"] = self._arrange_spots_for_schedule(daily["spots"], arrival_segment, departure_segment)
             daily["meal_paths"] = self._build_meal_paths(hotel, daily["spots"])
             daily["meal_candidate_pools"] = {
@@ -622,6 +647,33 @@ class TravelPlanningOrchestrator:
         x = math.radians(lon) * radius * math.cos(origin_lat)
         y = math.radians(lat) * radius
         return x, y
+
+    def _prepare_hotel_candidates(self, request: TripRequest, profile) -> list:
+        hotels = list(profile.hotels)
+        area_hint = (request.must_have_hotel_area or "").strip()
+        if not area_hint:
+            return hotels
+        if not hasattr(self.search_provider, "search_hotels"):
+            return hotels
+        try:
+            area_hotels = self.search_provider.search_hotels(profile.city, area_hint)
+        except Exception:
+            area_hotels = []
+        return self._merge_hotels(hotels, area_hotels)
+
+    def _merge_hotels(self, primary_hotels: list, extra_hotels: list) -> list:
+        merged = list(primary_hotels)
+        seen = {
+            f"{hotel.name.strip().lower()}|{(hotel.address or hotel.district or '').strip().lower()}"
+            for hotel in primary_hotels
+        }
+        for hotel in extra_hotels:
+            key = f"{hotel.name.strip().lower()}|{(hotel.address or hotel.district or '').strip().lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(hotel)
+        return merged
 
     def _build_budget(self, request: TripRequest, profile, day_plans: list[DayPlan]):
         round_trip_cost, round_trip_note = self.transport.estimate_round_trip_cost(request, profile)
