@@ -172,8 +172,11 @@ class TencentMapProvider:
         )
         result = payload.get("result") or {}
         route = (result.get("routes") or [{}])[0]
-        polyline = route.get("polyline") or self._extract_transit_polyline(route)
-        path = self._decode_polyline(polyline)
+        if mode == "transit":
+            path = self._extract_transit_path(route)
+        else:
+            polyline = route.get("polyline") or []
+            path = self._decode_polyline(polyline)
         safe_path = self._sanitize_path(path)
         if safe_path:
             path = safe_path
@@ -623,17 +626,198 @@ class TencentMapProvider:
             return f"{label_map.get(segment_type, segment_type)}从 {current['label']} 前往 {nxt['label']}，腾讯路径返回约 {duration_minutes} 分钟，路线约 {distance_km:.1f} km。"
         return f"{label_map.get(segment_type, segment_type)}从 {current['label']} 前往 {nxt['label']}，腾讯未返回可靠耗时，按路线距离估算约 {duration_minutes} 分钟 / {distance_km:.1f} km。"
 
-    def _extract_transit_polyline(self, route: dict) -> list:
+    def _extract_transit_path(self, route: dict) -> list[list[float]]:
+        path_parts: list[list[list[float]]] = []
+
+        route_polyline = route.get("polyline") or []
+        route_path = self._decode_and_sanitize_polyline(route_polyline)
+        if len(route_path) >= 2:
+            path_parts.append(route_path)
+
         steps = route.get("steps") or []
-        values: list = []
-        for step in steps:
-            polyline = step.get("polyline") or []
-            if isinstance(polyline, list) and polyline:
-                if not values:
-                    values.extend(polyline)
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                step_path = self._decode_and_sanitize_polyline(step.get("polyline") or [])
+                if len(step_path) >= 2:
+                    path_parts.append(step_path)
+
+                lines = step.get("lines") or []
+                if isinstance(lines, list):
+                    line = self._select_transit_line(lines)
+                    if isinstance(line, dict):
+                        line_path = self._decode_and_sanitize_polyline(line.get("polyline") or [])
+                        line_path = self._trim_transit_line_path(line_path, line)
+                        if len(line_path) >= 2:
+                            path_parts.append(line_path)
+
+        merged = self._merge_transit_path_parts(path_parts)
+        return self._repair_transit_internal_jumps(merged)
+
+    def _decode_and_sanitize_polyline(self, polyline: list) -> list[list[float]]:
+        return self._sanitize_path(self._decode_polyline(polyline))
+
+    def _trim_transit_line_path(self, path: list[list[float]], line: dict) -> list[list[float]]:
+        if len(path) < 2:
+            return path
+
+        geton = self._extract_location_lon_lat(line.get("geton"))
+        getoff = self._extract_location_lon_lat(line.get("getoff"))
+        if not geton or not getoff:
+            return path
+
+        start_idx = self._nearest_path_vertex(path, geton[0], geton[1])
+        end_idx = self._nearest_path_vertex(path, getoff[0], getoff[1])
+        if start_idx == end_idx:
+            return path
+        if start_idx < end_idx:
+            candidate = path[start_idx : end_idx + 1]
+        else:
+            candidate = list(reversed(path[end_idx : start_idx + 1]))
+        return candidate if len(candidate) >= 2 else path
+
+    def _extract_location_lon_lat(self, node: object) -> tuple[float, float] | None:
+        if not isinstance(node, dict):
+            return None
+        location = node.get("location")
+        if not isinstance(location, dict):
+            return None
+        lat = self._parse_numeric(location.get("lat"))
+        lon = self._parse_numeric(location.get("lng") or location.get("lon"))
+        if lat == 0 and lon == 0:
+            return None
+        if not self._is_valid_lon_lat(lon, lat):
+            return None
+        return (lon, lat)
+
+    def _nearest_path_vertex(self, path: list[list[float]], lon: float, lat: float) -> int:
+        best_index = 0
+        best_distance = float("inf")
+        for index, point in enumerate(path):
+            if len(point) < 2:
+                continue
+            distance = self._haversine(lat, lon, float(point[1]), float(point[0]))
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def _select_transit_line(self, lines: list) -> dict | None:
+        candidates = [line for line in lines if isinstance(line, dict)]
+        if not candidates:
+            return None
+        best = candidates[0]
+        best_score = float("inf")
+        for line in candidates:
+            distance_km = self._extract_route_distance_km(line, [])
+            duration_minutes = self._extract_route_duration_minutes(line, distance_km, "transit")
+            if duration_minutes <= 0:
+                duration_minutes = 999999
+            if duration_minutes < best_score:
+                best = line
+                best_score = duration_minutes
+        return best
+
+    def _merge_transit_path_parts(self, path_parts: list[list[list[float]]]) -> list[list[float]]:
+        merged: list[list[float]] = []
+        for part in path_parts:
+            if len(part) < 2:
+                continue
+            if not merged:
+                merged.extend(part)
+                continue
+
+            gap_km = self._haversine(
+                float(merged[-1][1]),
+                float(merged[-1][0]),
+                float(part[0][1]),
+                float(part[0][0]),
+            )
+            if gap_km > 0.35:
+                bridge = self._build_gap_bridge(merged[-1], part[0])
+                if bridge:
+                    if bridge[0] == merged[-1]:
+                        merged.extend(bridge[1:])
+                    else:
+                        merged.extend(bridge)
+
+            if merged and merged[-1] == part[0]:
+                merged.extend(part[1:])
+            else:
+                merged.extend(part)
+
+        return self._sanitize_path(merged)
+
+    def _build_gap_bridge(self, from_point: list[float], to_point: list[float]) -> list[list[float]]:
+        if len(from_point) < 2 or len(to_point) < 2:
+            return []
+        gap_km = self._haversine(
+            float(from_point[1]),
+            float(from_point[0]),
+            float(to_point[1]),
+            float(to_point[0]),
+        )
+        if gap_km <= 0.35 or gap_km > 8:
+            return []
+        try:
+            bridge_path, _, _ = self._request_route(
+                "walking",
+                {"lat": float(from_point[1]), "lon": float(from_point[0])},
+                {"lat": float(to_point[1]), "lon": float(to_point[0])},
+            )
+            safe_bridge = self._sanitize_path(bridge_path)
+            return safe_bridge if len(safe_bridge) >= 2 else []
+        except Exception:
+            return []
+
+    def _repair_transit_internal_jumps(self, path: list[list[float]]) -> list[list[float]]:
+        if len(path) < 2:
+            return path
+        repaired: list[list[float]] = [path[0]]
+        repairs = 0
+        max_repairs = 8
+        for point in path[1:]:
+            if len(point) < 2:
+                continue
+            prev = repaired[-1]
+            gap_km = self._haversine(
+                float(prev[1]),
+                float(prev[0]),
+                float(point[1]),
+                float(point[0]),
+            )
+            if gap_km <= 0.95 or repairs >= max_repairs:
+                repaired.append(point)
+                continue
+            bridge = self._build_visual_bridge(prev, point, gap_km)
+            if bridge:
+                if bridge[0] == prev:
+                    repaired.extend(bridge[1:])
                 else:
-                    values.extend(polyline[2:] if len(polyline) > 2 else polyline)
-        return values
+                    repaired.extend(bridge)
+                repairs += 1
+            else:
+                repaired.append(point)
+        return self._sanitize_path(repaired)
+
+    def _build_visual_bridge(
+        self,
+        from_point: list[float],
+        to_point: list[float],
+        gap_km: float,
+    ) -> list[list[float]]:
+        mode = "walking" if gap_km <= 1.2 else "driving"
+        try:
+            bridge_path, _, _ = self._request_route(
+                mode,
+                {"lat": float(from_point[1]), "lon": float(from_point[0])},
+                {"lat": float(to_point[1]), "lon": float(to_point[0])},
+            )
+            safe_bridge = self._sanitize_path(bridge_path)
+            return safe_bridge if len(safe_bridge) >= 2 else []
+        except Exception:
+            return []
 
     def _mode_sequence(self, preferred_mode: str) -> list[str]:
         if preferred_mode == "walk":

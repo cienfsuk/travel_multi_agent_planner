@@ -198,8 +198,13 @@ export default function HomeView({ onStart }: Props) {
                   type="number"
                   min={1}
                   className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 outline-none focus:border-sky-400 dark:border-slate-700 dark:bg-slate-900"
-                  value={form.days}
-                  onChange={(e) => setForm((prev) => ({ ...prev, days: Number(e.target.value) }))}
+                  value={form.days > 0 ? String(form.days) : ""}
+                  onChange={(e) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      days: e.target.value === "" ? 0 : Number(e.target.value),
+                    }))
+                  }
                 />
               </label>
               <label className="space-y-1 text-sm">
