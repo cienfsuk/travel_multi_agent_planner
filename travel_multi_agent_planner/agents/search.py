@@ -33,13 +33,19 @@ class SearchAgent:
         added_names: list[str] = []
 
         for required in required_names:
-            if self._find_matching_poi(candidates, required):
-                continue
+            existing_index = self._find_matching_poi_index(candidates, required)
             fetched = None
             if hasattr(search_provider, "search_poi_by_name"):
                 fetched = search_provider.search_poi_by_name(profile.city, required)
-            if fetched is not None:
+            if fetched is None:
+                continue
+            if existing_index is None:
                 candidates.append(fetched)
+                added_names.append(fetched.name)
+                continue
+            existing = candidates[existing_index]
+            if self._prefer_fetched_match(existing, fetched, required):
+                candidates[existing_index] = fetched
                 added_names.append(fetched.name)
 
         candidates = self._dedupe_pois(candidates)
@@ -125,16 +131,57 @@ class SearchAgent:
         return names
 
     def _find_matching_poi(self, pois: list[PointOfInterest], required_name: str) -> PointOfInterest | None:
+        index = self._find_matching_poi_index(pois, required_name)
+        if index is None:
+            return None
+        return pois[index]
+
+    def _find_matching_poi_index(self, pois: list[PointOfInterest], required_name: str) -> int | None:
         required_norm = self._normalize_text(required_name)
         if not required_norm:
             return None
-        for poi in pois:
+        for idx, poi in enumerate(pois):
             poi_norm = self._normalize_text(poi.name)
             if not poi_norm:
                 continue
             if poi_norm == required_norm or required_norm in poi_norm or poi_norm in required_norm:
-                return poi
+                return idx
         return None
+
+    def _prefer_fetched_match(
+        self,
+        existing: PointOfInterest,
+        fetched: PointOfInterest,
+        required_name: str,
+    ) -> bool:
+        if self._poi_key(existing) == self._poi_key(fetched):
+            return False
+        existing_score = self._required_match_score(existing.name, required_name)
+        fetched_score = self._required_match_score(fetched.name, required_name)
+        if fetched_score != existing_score:
+            return fetched_score > existing_score
+
+        required_norm = self._normalize_text(required_name)
+        existing_gap = abs(len(self._normalize_text(existing.name)) - len(required_norm))
+        fetched_gap = abs(len(self._normalize_text(fetched.name)) - len(required_norm))
+        if fetched_gap != existing_gap:
+            return fetched_gap < existing_gap
+
+        # Same quality tie-break: keep Tencent top-1 query result.
+        return True
+
+    def _required_match_score(self, poi_name: str, required_name: str) -> int:
+        poi_norm = self._normalize_text(poi_name)
+        required_norm = self._normalize_text(required_name)
+        if not poi_norm or not required_norm:
+            return 0
+        if poi_norm == required_norm:
+            return 3
+        if poi_norm.startswith(required_norm):
+            return 2
+        if required_norm in poi_norm or poi_norm in required_norm:
+            return 1
+        return 0
 
     def _has_avoid_tag(self, poi: PointOfInterest, avoid_tags: set[str]) -> bool:
         tags = {tag.strip().lower() for tag in poi.tags if tag.strip()}

@@ -97,12 +97,13 @@ class TencentMapProvider:
     def reorder_spots(self, hotel: dict, spots: list) -> list:
         if len(spots) <= 1:
             return list(spots)
-        if len(spots) <= 3:
-            return self._improve_spot_order(hotel, list(spots))
         spot_nodes = [{"lat": spot.lat, "lon": spot.lon} for spot in spots]
-        order = self.waypoint_order(hotel, spot_nodes)
+        if len(spots) <= 3:
+            order = self._matrix_order(hotel, spot_nodes)
+        else:
+            order = self.waypoint_order(hotel, spot_nodes)
         ordered = [spots[index] for index in order if 0 <= index < len(spots)]
-        return self._improve_spot_order(hotel, ordered)
+        return ordered or list(spots)
 
     def route_walking(self, current: dict, nxt: dict) -> tuple[list[list[float]], int, float]:
         return self._request_route("walking", current, nxt)
@@ -166,7 +167,11 @@ class TencentMapProvider:
         if not isinstance(polyline, list) or len(polyline) < 2:
             return []
         values = [float(item) for item in polyline]
-        if len(values) > 4:
+        # Tencent polyline stores the first point as absolute coordinates and
+        # all subsequent values as 1e6 deltas against the value two positions before.
+        # This also applies to a 2-point route (len == 4), so decode whenever
+        # there is at least one delta pair.
+        if len(values) > 2:
             for index in range(2, len(values)):
                 values[index] = values[index - 2] + values[index] / 1000000
         points: list[list[float]] = []

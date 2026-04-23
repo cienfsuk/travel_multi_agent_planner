@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Calendar, FileDown, ShieldCheck, Target, X } from "lucide-react";
 import type {
   AgentTraceStep,
+  AnimationSegment,
   AnimationStep,
   SourceEvidence,
   PlanResponse,
@@ -71,6 +72,28 @@ function summarizeStepTransport(step: AnimationStep) {
   return `${step.next_transport_type} · ${detailParts.join(" · ")}`;
 }
 
+function computeSegmentPlaybackMs(
+  segment: AnimationSegment | null,
+  speed: "slow" | "normal" | "fast",
+): number {
+  const baseMs = { slow: 2600, normal: 1700, fast: 1100 }[speed];
+  if (!segment) {
+    return Math.round(baseMs * 0.95);
+  }
+  const durationMinutes = Math.max(1, segment.duration || 0);
+  const distanceKm = Math.max(0.2, segment.distance_km || 0);
+  const pathPoints = Math.max(2, segment.path?.length || 0);
+
+  const durationFactor = Math.max(0.7, Math.min(4.5, durationMinutes / 6));
+  const distanceFactor = Math.max(0.7, Math.min(4.5, distanceKm / 2.5));
+  const pathFactor = Math.max(0.7, Math.min(3.5, pathPoints / 22));
+  const factor = durationFactor * 0.5 + distanceFactor * 0.35 + pathFactor * 0.15;
+
+  return Math.round(
+    Math.max(baseMs * 0.8, Math.min(baseMs * 6, baseMs * factor)),
+  );
+}
+
 function flattenEvidence(plan: PlanResponse["plan"]): EvidenceRow[] {
   const rows: EvidenceRow[] = [];
   const pushEvidence = (
@@ -114,6 +137,21 @@ function normalizeMatchText(value: string): string {
     .replace(/[\s·・,，。；:：\-_/()（）]+/g, "");
 }
 
+function isPreferenceStatusNote(value: string): boolean {
+  const normalized = normalizeMatchText(value);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes("必达景点") ||
+    normalized.includes("偏好景点") ||
+    normalized.includes("已补充必达景点") ||
+    normalized.includes("仍有必达景点未命中") ||
+    normalized.startsWith("仍未命中") ||
+    normalized.startsWith("已命中")
+  );
+}
+
 const MAP_DAY_COLORS = [
   "#2563eb",
   "#f97316",
@@ -150,6 +188,8 @@ export default function ResultView({ result }: Props) {
   const [mapDay, setMapDay] = useState<number | null>(null);
   const [mapStepIndex, setMapStepIndex] = useState(0);
   const [isMapPlaying, setIsMapPlaying] = useState(false);
+  const [hasMapPlaybackStarted, setHasMapPlaybackStarted] = useState(false);
+  const [mapSegmentProgress, setMapSegmentProgress] = useState(0);
   const [mapPlaySpeed, setMapPlaySpeed] = useState<"slow" | "normal" | "fast">(
     "normal",
   );
@@ -163,6 +203,28 @@ export default function ResultView({ result }: Props) {
       ? animation.steps.filter((s) => s.day === mapDay)
       : animation.steps;
   }, [animation, mapDay]);
+  const filteredAnimSegments = useMemo(() => {
+    if (!animation) return [];
+    return mapDay != null
+      ? animation.segments.filter((s) => s.day === mapDay)
+      : animation.segments;
+  }, [animation, mapDay]);
+  const segmentLookup = useMemo(() => {
+    const lookup = new Map<string, AnimationSegment>();
+    for (const segment of filteredAnimSegments) {
+      lookup.set(`${segment.day}-${segment.step_index}`, segment);
+    }
+    return lookup;
+  }, [filteredAnimSegments]);
+  const currentAnimatingSegment = useMemo(() => {
+    const step = filteredAnimSteps[mapStepIndex];
+    if (!step) return null;
+    return segmentLookup.get(`${step.day}-${step.step_index}`) ?? null;
+  }, [filteredAnimSteps, mapStepIndex, segmentLookup]);
+  const currentSegmentPlaybackMs = useMemo(
+    () => computeSegmentPlaybackMs(currentAnimatingSegment, mapPlaySpeed),
+    [currentAnimatingSegment, mapPlaySpeed],
+  );
 
   const currentAnimStep = filteredAnimSteps[mapStepIndex] || null;
 
@@ -183,27 +245,54 @@ export default function ResultView({ result }: Props) {
   useEffect(() => {
     setMapStepIndex(0);
     setIsMapPlaying(false);
+    setHasMapPlaybackStarted(false);
+    setMapSegmentProgress(0);
   }, [mapDay]);
 
   // Playback timer
   useEffect(() => {
     if (!isMapPlaying || !filteredAnimSteps.length) return;
-    const speedMs = { slow: 2200, normal: 1400, fast: 860 }[mapPlaySpeed];
-    const timer = setInterval(() => {
-      setMapStepIndex((i) => {
-        if (i >= filteredAnimSteps.length - 1) {
-          setIsMapPlaying(false);
-          return i;
+    if (filteredAnimSteps.length <= 1) {
+      setIsMapPlaying(false);
+      return;
+    }
+    const tickMs = 33;
+    const delta = tickMs / currentSegmentPlaybackMs;
+    const timer = window.setInterval(() => {
+      setMapSegmentProgress((progress) => {
+        const nextProgress = Math.min(1, progress + delta);
+        if (nextProgress < 1) {
+          return nextProgress;
         }
-        return i + 1;
+        setMapStepIndex((i) => {
+          const lastIndex = filteredAnimSteps.length - 1;
+          const nextIndex = Math.min(i + 1, lastIndex);
+          if (nextIndex >= lastIndex) {
+            setIsMapPlaying(false);
+          }
+          return nextIndex;
+        });
+        return 0;
       });
-    }, speedMs);
-    return () => clearInterval(timer);
-  }, [isMapPlaying, mapPlaySpeed, filteredAnimSteps.length]);
+    }, tickMs);
+    return () => window.clearInterval(timer);
+  }, [
+    isMapPlaying,
+    currentSegmentPlaybackMs,
+    mapStepIndex,
+    filteredAnimSteps.length,
+  ]);
+
+  useEffect(() => {
+    if (!isMapPlaying) {
+      return;
+    }
+    setMapSegmentProgress(0);
+  }, [mapStepIndex, isMapPlaying]);
 
   // Fly to step node when step changes
   useEffect(() => {
-    if (!animation || !mapRef.current) return;
+    if (!animation || !mapRef.current || isMapPlaying) return;
     const steps =
       mapDay != null
         ? animation.steps.filter((s) => s.day === mapDay)
@@ -216,24 +305,43 @@ export default function ResultView({ result }: Props) {
     if (node) {
       mapRef.current.flyTo(node.lat, node.lon, node.day, node.step_index);
     }
-  }, [mapStepIndex, mapDay, animation]);
+  }, [mapStepIndex, mapDay, animation, isMapPlaying]);
 
   const handleMapPrevStep = () => {
     setMapStepIndex((i) => Math.max(0, i - 1));
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
   const handleMapNextStep = () => {
     setMapStepIndex((i) => Math.min(filteredAnimSteps.length - 1, i + 1));
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
-  const handleMapPlayPause = () => setIsMapPlaying((v) => !v);
+  const handleMapPlayPause = () => {
+    if (!filteredAnimSteps.length) {
+      return;
+    }
+    if (isMapPlaying) {
+      setIsMapPlaying(false);
+      return;
+    }
+    if (mapStepIndex >= filteredAnimSteps.length - 1) {
+      setMapStepIndex(0);
+      setMapSegmentProgress(0);
+    }
+    setHasMapPlaybackStarted(true);
+    setIsMapPlaying(true);
+  };
   const handleMapReset = () => {
     setMapStepIndex(0);
     setIsMapPlaying(false);
+    setHasMapPlaybackStarted(false);
+    setMapSegmentProgress(0);
   };
   const handleJumpToStep = (idx: number) => {
     setMapStepIndex(idx);
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
 
   useEffect(() => {
@@ -310,6 +418,23 @@ export default function ResultView({ result }: Props) {
       missing,
     };
   }, [plan.constraints, plan.days]);
+  const filteredSearchNotes = useMemo(() => {
+    const deduped = new Set<string>();
+    const notes: string[] = [];
+    for (const raw of plan.search_notes ?? []) {
+      const note = raw?.trim();
+      if (!note || isPreferenceStatusNote(note)) {
+        continue;
+      }
+      const key = normalizeMatchText(note);
+      if (!key || deduped.has(key)) {
+        continue;
+      }
+      deduped.add(key);
+      notes.push(note);
+    }
+    return notes.slice(0, 5);
+  }, [plan.search_notes]);
 
   useEffect(() => {
     setEvidencePage(1);
@@ -446,12 +571,12 @@ export default function ResultView({ result }: Props) {
                         </span>
                       )}
                     </div>
-                    {(mustHitStatus || !!plan.search_notes?.length) && (
+                    {(mustHitStatus || filteredSearchNotes.length > 0) && (
                       <div className="rounded-xl bg-slate-50 p-3 text-xs dark:bg-slate-900/40">
                         {mustHitStatus && (
                           <div className="space-y-1 pb-1">
                             <div>
-                              - 必达景点已命中：
+                              - 偏好景点已命中：
                               {mustHitStatus.hits.length
                                 ? mustHitStatus.hits.join("、")
                                 : "无"}
@@ -459,12 +584,12 @@ export default function ResultView({ result }: Props) {
                             </div>
                             {mustHitStatus.missing.length > 0 && (
                               <div className="text-amber-600 dark:text-amber-400">
-                                - 仍未命中：{mustHitStatus.missing.join("、")}。
+                                - 偏好景点未命中：{mustHitStatus.missing.join("、")}。
                               </div>
                             )}
                           </div>
                         )}
-                        {(plan.search_notes ?? []).slice(0, 5).map((note, idx) => (
+                        {filteredSearchNotes.map((note, idx) => (
                           <div key={idx}>- {note}</div>
                         ))}
                       </div>
@@ -694,6 +819,8 @@ export default function ResultView({ result }: Props) {
                     ref={mapRef}
                     animation={animation}
                     selectedDay={mapDay}
+                    showRoutes={hasMapPlaybackStarted}
+                    stepProgress={hasMapPlaybackStarted ? mapSegmentProgress : 0}
                     activeStepKey={
                       currentAnimStep
                         ? {

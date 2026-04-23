@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -137,6 +138,12 @@ def load_latest_case() -> tuple[TripPlan, AnimationBundle, SavedCaseRecord] | No
 def load_case_record(record: SavedCaseRecord) -> tuple[TripPlan, AnimationBundle, SavedCaseRecord]:
     plan_dict = json.loads(Path(record.plan_path).read_text(encoding="utf-8"))
     animation_dict = json.loads(Path(record.animation_path).read_text(encoding="utf-8"))
+    plan_changed = _repair_plan_payload_paths(plan_dict)
+    animation_changed = _repair_animation_payload_paths(animation_dict)
+    if plan_changed:
+        Path(record.plan_path).write_text(json.dumps(plan_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+    if animation_changed:
+        Path(record.animation_path).write_text(json.dumps(animation_dict, ensure_ascii=False, indent=2), encoding="utf-8")
     normalized_record = SavedCaseRecord(**_normalize_saved_case_record(record.__dict__))
     if not normalized_record.bundle_version:
         normalized_record.bundle_version = int(animation_dict.get("bundle_version", 1) or 1)
@@ -319,6 +326,132 @@ def _build_meal(data: dict) -> MealRecommendation:
 
 def _build_evidence(data: dict) -> EvidenceItem:
     return EvidenceItem(**data)
+
+
+def _repair_plan_payload_paths(plan_dict: dict) -> bool:
+    changed = False
+    for day in plan_dict.get("day_plans", []):
+        for key in ("transport_segments",):
+            for segment in day.get(key, []) or []:
+                sanitized, path_changed = _sanitize_serialized_path(segment.get("path", []))
+                if path_changed:
+                    segment["path"] = sanitized
+                    changed = True
+        for key in ("arrival_segment", "departure_segment"):
+            segment = day.get(key)
+            if not isinstance(segment, dict):
+                continue
+            sanitized, path_changed = _sanitize_serialized_path(segment.get("path", []))
+            if path_changed:
+                segment["path"] = sanitized
+                changed = True
+    return changed
+
+
+def _repair_animation_payload_paths(animation_dict: dict) -> bool:
+    changed = False
+    node_lookup: dict[tuple[int, int], tuple[float, float]] = {}
+    for node in animation_dict.get("nodes", []) or []:
+        lon_lat, point_changed = _normalize_serialized_point([node.get("lon"), node.get("lat")])
+        if lon_lat is None:
+            continue
+        lon, lat = lon_lat
+        node_lookup[(int(node.get("day", 0)), int(node.get("step_index", 0)))] = (lon, lat)
+        if point_changed:
+            node["lon"] = lon
+            node["lat"] = lat
+            changed = True
+
+    for segment in animation_dict.get("segments", []) or []:
+        sanitized, path_changed = _sanitize_serialized_path(segment.get("path", []))
+        if len(sanitized) < 2:
+            day = int(segment.get("day", 0))
+            step_index = int(segment.get("step_index", 0))
+            start = node_lookup.get((day, step_index))
+            end = node_lookup.get((day, step_index + 1))
+            if start and end:
+                sanitized = [[start[0], start[1]], [end[0], end[1]]]
+                path_changed = True
+        if path_changed:
+            segment["path"] = sanitized
+            changed = True
+    return changed
+
+
+def _sanitize_serialized_path(path: list) -> tuple[list[list[float]], bool]:
+    if not isinstance(path, list):
+        return [], True
+    changed = False
+    cleaned: list[list[float]] = []
+    prev: tuple[float, float] | None = None
+    for raw in path:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            changed = True
+            continue
+        lon_lat, point_changed = _normalize_serialized_point(raw, prev)
+        if lon_lat is None:
+            changed = True
+            continue
+        if point_changed:
+            changed = True
+        lon, lat = lon_lat
+        if prev is not None and math.isclose(prev[0], lon) and math.isclose(prev[1], lat):
+            changed = True
+            continue
+        cleaned.append([lon, lat])
+        prev = (lon, lat)
+    if len(cleaned) != len(path):
+        changed = True
+    return cleaned, changed
+
+
+def _normalize_serialized_point(
+    raw_point: list | tuple,
+    prev: tuple[float, float] | None = None,
+) -> tuple[tuple[float, float] | None, bool]:
+    try:
+        first = float(raw_point[0])
+        second = float(raw_point[1])
+    except Exception:
+        return None, True
+
+    if _is_valid_lon_lat(first, second):
+        direct = (first, second)
+        if prev is None or _is_locally_continuous(prev, direct):
+            return direct, False
+
+    # Fallback for legacy bad decode data:
+    # Tencent deltas were left undecoded (e.g. [3, -150]) and should be applied
+    # as 1e6 increments from previous valid point.
+    if (
+        prev is not None
+        and abs(first) <= 1_000_000
+        and abs(second) <= 1_000_000
+    ):
+        candidate = (prev[0] + first / 1_000_000, prev[1] + second / 1_000_000)
+        if _is_valid_lon_lat(candidate[0], candidate[1]) and _is_locally_continuous(prev, candidate):
+            return candidate, True
+
+    # Fallback: value order accidentally swapped as [lat, lon].
+    if _is_valid_lon_lat(second, first):
+        swapped = (second, first)
+        if prev is None or _is_locally_continuous(prev, swapped):
+            return swapped, True
+
+    return None, True
+
+
+def _is_valid_lon_lat(lon: float, lat: float) -> bool:
+    return (
+        math.isfinite(lon)
+        and math.isfinite(lat)
+        and -180.0 <= lon <= 180.0
+        and -90.0 <= lat <= 90.0
+    )
+
+
+def _is_locally_continuous(prev: tuple[float, float], nxt: tuple[float, float]) -> bool:
+    return abs(prev[0] - nxt[0]) <= 1.5 and abs(prev[1] - nxt[1]) <= 1.5
 
 
 def _slugify(value: str) -> str:

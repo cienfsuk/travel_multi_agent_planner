@@ -278,22 +278,20 @@ class TencentMapSearchProvider:
         query = (poi_name or "").strip()
         if not query:
             return None
-        items = self._place_search(f"{city_name}{query}", city_name, page_size=6)
+        items: list[dict] = []
+        for keyword in (query, f"{city_name}{query}"):
+            keyword_norm = keyword.strip().lower()
+            if not keyword_norm:
+                continue
+            current = self._place_search(keyword, city_name, page_size=6, orderby=None)
+            if current:
+                items = current
+                break
         if not items:
             return None
 
-        best_item = None
-        query_lower = query.lower()
-        for item in items:
-            title = str(item.get("title") or item.get("name") or "").strip()
-            if not title:
-                continue
-            title_lower = title.lower()
-            if query_lower in title_lower or title_lower in query_lower:
-                best_item = item
-                break
-        if best_item is None:
-            best_item = items[0]
+        # Required POI retrieval must follow Tencent search ranking directly.
+        best_item = items[0]
 
         enriched = self._enrich_place_item(best_item)
         lat, lon = self._item_latlon(enriched)
@@ -638,18 +636,27 @@ class TencentMapSearchProvider:
                 enriched["address"] = formatted
         return enriched
 
-    def _place_search(self, keyword: str, city_name: str, page_size: int = 6, boundary: str | None = None) -> list[dict]:
+    def _place_search(
+        self,
+        keyword: str,
+        city_name: str,
+        page_size: int = 6,
+        boundary: str | None = None,
+        orderby: str | None = "_distance",
+    ) -> list[dict]:
         self._ensure_key()
+        params = {
+            "keyword": keyword,
+            "boundary": boundary or f"region({city_name},0)",
+            "page_size": page_size,
+            "page_index": 1,
+            "key": self.api_key,
+        }
+        if orderby:
+            params["orderby"] = orderby
         payload = self._get(
             "https://apis.map.qq.com/ws/place/v1/search",
-            {
-                "keyword": keyword,
-                "boundary": boundary or f"region({city_name},0)",
-                "page_size": page_size,
-                "page_index": 1,
-                "orderby": "_distance",
-                "key": self.api_key,
-            },
+            params,
         )
         data = payload.get("data")
         return data if isinstance(data, list) else []

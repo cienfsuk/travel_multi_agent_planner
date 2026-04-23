@@ -112,6 +112,212 @@ function applyGeometries(layer: any, geometries: any[]) {
   }
 }
 
+function compareStepKey(
+  dayA: number,
+  stepIndexA: number,
+  dayB: number,
+  stepIndexB: number,
+): number {
+  if (dayA !== dayB) {
+    return dayA - dayB;
+  }
+  return stepIndexA - stepIndexB;
+}
+
+function segmentDistanceMeters(
+  start: [number, number],
+  end: [number, number],
+): number {
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const lat1 = toRad(start[1]);
+  const lat2 = toRad(end[1]);
+  const dLat = lat2 - lat1;
+  const dLon = toRad(end[0] - start[0]);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1) *
+      Math.cos(lat2) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function locatePathProgress(
+  path: [number, number][],
+  progress: number,
+): { index: number; point: [number, number] } | null {
+  if (!Array.isArray(path) || path.length < 2) {
+    return null;
+  }
+  const clamped = Math.max(0, Math.min(1, progress));
+  if (clamped <= 0) {
+    return { index: 0, point: [path[0][0], path[0][1]] };
+  }
+  if (clamped >= 1) {
+    const last = path[path.length - 1];
+    return { index: path.length - 2, point: [last[0], last[1]] };
+  }
+
+  const cumulative: number[] = [0];
+  for (let i = 1; i < path.length; i += 1) {
+    const dist = Math.max(0, segmentDistanceMeters(path[i - 1], path[i]));
+    cumulative.push(cumulative[i - 1] + dist);
+  }
+  const total = cumulative[cumulative.length - 1];
+  if (total <= 0) {
+    return { index: 0, point: [path[0][0], path[0][1]] };
+  }
+
+  const target = total * clamped;
+  for (let i = 1; i < cumulative.length; i += 1) {
+    if (target > cumulative[i]) {
+      continue;
+    }
+    const prevTotal = cumulative[i - 1];
+    const segTotal = cumulative[i] - prevTotal;
+    const ratio = segTotal <= 0 ? 1 : (target - prevTotal) / segTotal;
+    const start = path[i - 1];
+    const end = path[i];
+    return {
+      index: i - 1,
+      point: [
+        start[0] + (end[0] - start[0]) * ratio,
+        start[1] + (end[1] - start[1]) * ratio,
+      ],
+    };
+  }
+
+  const last = path[path.length - 1];
+  return { index: path.length - 2, point: [last[0], last[1]] };
+}
+
+function partialPath(
+  path: [number, number][],
+  progress: number,
+): [number, number][] {
+  if (!Array.isArray(path) || path.length < 2) {
+    return path || [];
+  }
+  const located = locatePathProgress(path, progress);
+  if (!located) {
+    return path;
+  }
+  const visible = path.slice(0, located.index + 1);
+  visible.push(located.point);
+  return visible;
+}
+
+function currentPosition(
+  path: [number, number][],
+  progress: number,
+): [number, number] | null {
+  const located = locatePathProgress(path, progress);
+  return located ? located.point : null;
+}
+
+function isValidLonLat(lon: number, lat: number): boolean {
+  return (
+    Number.isFinite(lon) &&
+    Number.isFinite(lat) &&
+    lon >= -180 &&
+    lon <= 180 &&
+    lat >= -90 &&
+    lat <= 90
+  );
+}
+
+function isLocallyContinuous(
+  prev: [number, number],
+  next: [number, number],
+): boolean {
+  return (
+    Math.abs(prev[0] - next[0]) <= 1.5 && Math.abs(prev[1] - next[1]) <= 1.5
+  );
+}
+
+function normalizeLonLatPoint(
+  point: [number, number],
+): [number, number] | null {
+  const x = Number(point[0]);
+  const y = Number(point[1]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+  if (isValidLonLat(x, y)) {
+    return [x, y];
+  }
+  return null;
+}
+
+function normalizePathPoint(
+  point: [number, number],
+  prev: [number, number] | null,
+): [number, number] | null {
+  const direct = normalizeLonLatPoint(point);
+  if (direct && (!prev || isLocallyContinuous(prev, direct))) {
+    return direct;
+  }
+  const x = Number(point[0]);
+  const y = Number(point[1]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  // Legacy fallback: bad decode left Tencent deltas undecoded (e.g. [3, -150]).
+  if (
+    prev &&
+    Math.abs(x) <= 1_000_000 &&
+    Math.abs(y) <= 1_000_000
+  ) {
+    const candidate: [number, number] = [prev[0] + x / 1_000_000, prev[1] + y / 1_000_000];
+    if (isValidLonLat(candidate[0], candidate[1]) && isLocallyContinuous(prev, candidate)) {
+      return candidate;
+    }
+  }
+
+  // Swap fallback only if it remains locally continuous to avoid huge jumps.
+  if (isValidLonLat(y, x)) {
+    const swapped: [number, number] = [y, x];
+    if (!prev || isLocallyContinuous(prev, swapped)) {
+      return swapped;
+    }
+  }
+  return null;
+}
+
+function sanitizePath(path: [number, number][]): [number, number][] {
+  if (!Array.isArray(path)) {
+    return [];
+  }
+  const cleaned: [number, number][] = [];
+  for (const point of path) {
+    if (!Array.isArray(point) || point.length < 2) {
+      continue;
+    }
+    const prev = cleaned[cleaned.length - 1] ?? null;
+    const normalized = normalizePathPoint([point[0], point[1]], prev);
+    if (!normalized) {
+      continue;
+    }
+    if (!prev || prev[0] !== normalized[0] || prev[1] !== normalized[1]) {
+      cleaned.push(normalized);
+    }
+  }
+  return cleaned;
+}
+
+function toLatLng(
+  TMap: any,
+  lonRaw: number,
+  latRaw: number,
+): any | null {
+  const normalized = normalizeLonLatPoint([lonRaw, latRaw]);
+  if (!normalized) {
+    return null;
+  }
+  return new TMap.LatLng(normalized[1], normalized[0]);
+}
+
 export interface TripMapHandle {
   flyTo(lat: number, lon: number, day: number, stepIndex: number): void;
 }
@@ -120,15 +326,27 @@ interface Props {
   animation: AnimationBundle | null;
   selectedDay?: number | null;
   activeStepKey?: { day: number; stepIndex: number } | null;
+  showRoutes?: boolean;
+  stepProgress?: number;
 }
 
 const TripMapView = forwardRef<TripMapHandle, Props>(
-  ({ animation, selectedDay, activeStepKey }, ref) => {
+  (
+    {
+      animation,
+      selectedDay,
+      activeStepKey,
+      showRoutes = false,
+      stepProgress = 0,
+    },
+    ref,
+  ) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<any>(null);
     const segLayerRef = useRef<any>(null);
     const nodeLayerRef = useRef<any>(null);
     const hlLayerRef = useRef<any>(null);
+    const lastFitKeyRef = useRef("");
     const [mapReady, setMapReady] = useState(false);
 
     // Load SDK and init map on mount
@@ -190,7 +408,33 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       };
     }, []);
 
-    // Draw animation whenever map or data changes
+    // Lock map zoom interactions (wheel / double-click / pinch) for presentation mode.
+    useEffect(() => {
+      const container = containerRef.current;
+      if (!container) return;
+      const preventWheel = (event: WheelEvent) => {
+        event.preventDefault();
+      };
+      const preventGesture = (event: Event) => {
+        event.preventDefault();
+      };
+      container.addEventListener("wheel", preventWheel, { passive: false });
+      container.addEventListener("dblclick", preventGesture, { passive: false });
+      container.addEventListener("gesturestart", preventGesture, {
+        passive: false,
+      });
+      container.addEventListener("gesturechange", preventGesture, {
+        passive: false,
+      });
+      return () => {
+        container.removeEventListener("wheel", preventWheel);
+        container.removeEventListener("dblclick", preventGesture);
+        container.removeEventListener("gesturestart", preventGesture);
+        container.removeEventListener("gesturechange", preventGesture);
+      };
+    }, []);
+
+    // Draw animation whenever map or playback progress changes.
     useEffect(() => {
       if (!mapReady || !animation || !window.TMap) return;
       const TMap = window.TMap;
@@ -202,31 +446,64 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
         selectedDay != null
           ? animation.segments.filter((s) => s.day === selectedDay)
           : animation.segments;
+      const normalizedProgress = Math.max(0, Math.min(1, stepProgress));
+      const activeDay = activeStepKey?.day;
+      const activeStepIndex = activeStepKey?.stepIndex;
 
-      // --- Polylines ---
+      // --- Polylines (only revealed route up to current moving position) ---
       const segStyles: Record<string, any> = {};
       const segGeoms: any[] = [];
-      segments
-        .filter((s) => s.path && s.path.length >= 2)
-        .forEach((seg, idx) => {
-          const id = `seg-${idx}`;
-          segStyles[id] = new TMap.PolylineStyle({
-            color: seg.color || "#6366f1",
-            width: 7,
-            borderWidth: 0,
-            lineCap: "round",
+      if (showRoutes && activeDay != null && activeStepIndex != null) {
+        segments
+          .filter((segment) => Array.isArray(segment.path) && segment.path.length >= 2)
+          .forEach((segment, idx) => {
+            const safePath = sanitizePath(segment.path);
+            if (safePath.length < 2) {
+              return;
+            }
+            const order = compareStepKey(
+              segment.day,
+              segment.step_index,
+              activeDay,
+              activeStepIndex,
+            );
+            let progress = 0;
+            if (order < 0) {
+              progress = 1;
+            } else if (order === 0) {
+              progress = normalizedProgress;
+            }
+            if (order > 0) {
+              return;
+            }
+            const clippedPath = partialPath(safePath, progress);
+            if (clippedPath.length < 2) {
+              return;
+            }
+            const latLngPath = clippedPath
+              .map(([lon, lat]: [number, number]) => toLatLng(TMap, lon, lat))
+              .filter(Boolean);
+            if (latLngPath.length < 2) {
+              return;
+            }
+            const id = `seg-${idx}`;
+            segStyles[id] = new TMap.PolylineStyle({
+              color: segment.color || "#6366f1",
+              width: 7,
+              borderWidth: 0,
+              lineCap: "round",
+            });
+            segGeoms.push({
+              id,
+              styleId: id,
+              paths: latLngPath,
+            });
           });
-          segGeoms.push({
-            id,
-            styleId: id,
-            paths: seg.path.map(
-              ([lon, lat]: [number, number]) => new TMap.LatLng(lat, lon),
-            ),
-          });
-        });
+      }
       if (segLayerRef.current) {
-        if (typeof segLayerRef.current.setStyles === "function")
+        if (typeof segLayerRef.current.setStyles === "function") {
           segLayerRef.current.setStyles(segStyles);
+        }
         applyGeometries(segLayerRef.current, segGeoms);
       }
 
@@ -234,6 +511,10 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       const markerStyles: Record<string, any> = {};
       const markerGeoms: any[] = [];
       nodes.forEach((node, idx) => {
+        const nodeLatLng = toLatLng(TMap, node.lon, node.lat);
+        if (!nodeLatLng) {
+          return;
+        }
         const fill = node.type_color || nodeTypeColor(node.kind);
         const outline = node.day_color || dayColor(node.day);
         const id = `node-${idx}`;
@@ -246,23 +527,50 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
         markerGeoms.push({
           id: `node-${node.day}-${node.step_index}`,
           styleId: id,
-          position: new TMap.LatLng(node.lat, node.lon),
+          position: nodeLatLng,
         });
       });
       if (nodeLayerRef.current) {
-        if (typeof nodeLayerRef.current.setStyles === "function")
+        if (typeof nodeLayerRef.current.setStyles === "function") {
           nodeLayerRef.current.setStyles(markerStyles);
+        }
         applyGeometries(nodeLayerRef.current, markerGeoms);
       }
 
-      // Highlight active step node
+      // Highlight active step node or moving position on current segment.
       if (activeStepKey && hlLayerRef.current) {
         const activeNode = nodes.find(
           (n) =>
             n.day === activeStepKey.day &&
             n.step_index === activeStepKey.stepIndex,
         );
-        if (activeNode) {
+        const currentSegment =
+          activeDay != null && activeStepIndex != null
+            ? segments.find(
+                (segment) =>
+                  segment.day === activeDay &&
+                  segment.step_index === activeStepIndex &&
+                  Array.isArray(segment.path) &&
+                  segment.path.length >= 2,
+              )
+            : undefined;
+        const currentSegmentPath = currentSegment
+          ? sanitizePath(currentSegment.path)
+          : [];
+        const movingPoint =
+          showRoutes && currentSegmentPath.length >= 2
+            ? currentPosition(currentSegmentPath, normalizedProgress)
+            : null;
+        const markerLon = movingPoint?.[0] ?? activeNode?.lon;
+        const markerLat = movingPoint?.[1] ?? activeNode?.lat;
+        const markerLatLng =
+          typeof markerLon === "number" && typeof markerLat === "number"
+            ? toLatLng(TMap, markerLon, markerLat)
+            : null;
+        if (
+          activeNode &&
+          markerLatLng
+        ) {
           const fill = activeNode.type_color || nodeTypeColor(activeNode.kind);
           if (typeof hlLayerRef.current.setStyles === "function") {
             hlLayerRef.current.setStyles({
@@ -278,7 +586,7 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
             {
               id: "current",
               styleId: "hl",
-              position: new TMap.LatLng(activeNode.lat, activeNode.lon),
+              position: markerLatLng,
             },
           ]);
         } else {
@@ -287,18 +595,47 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       } else {
         applyGeometries(hlLayerRef.current, []);
       }
+    }, [
+      animation,
+      mapReady,
+      selectedDay,
+      activeStepKey,
+      showRoutes,
+      stepProgress,
+    ]);
 
-      // Fit bounds
-      if (nodes.length > 0) {
-        const lats = nodes.map((n) => n.lat);
-        const lons = nodes.map((n) => n.lon);
-        const bounds = new TMap.LatLngBounds(
-          new TMap.LatLng(Math.min(...lats), Math.min(...lons)),
-          new TMap.LatLng(Math.max(...lats), Math.max(...lons)),
-        );
-        mapRef.current?.fitBounds(bounds, { padding: 70 });
+    // Fit bounds only when day filter/data changes, not during each progress tick.
+    useEffect(() => {
+      if (!mapReady || !animation || !window.TMap) return;
+      const TMap = window.TMap;
+      const nodes =
+        selectedDay != null
+          ? animation.nodes.filter((n) => n.day === selectedDay)
+          : animation.nodes;
+      const validNodes = nodes
+        .map((node) => {
+          const normalized = normalizeLonLatPoint([node.lon, node.lat]);
+          return normalized ? { node, lon: normalized[0], lat: normalized[1] } : null;
+        })
+        .filter(Boolean) as Array<{
+        node: (typeof nodes)[number];
+        lon: number;
+        lat: number;
+      }>;
+      if (!validNodes.length) return;
+      const fitKey = `${animation.case_id}|${selectedDay ?? "all"}|${nodes.length}`;
+      if (lastFitKeyRef.current === fitKey) {
+        return;
       }
-    }, [animation, mapReady, selectedDay, activeStepKey]);
+      lastFitKeyRef.current = fitKey;
+      const lats = validNodes.map((n) => n.lat);
+      const lons = validNodes.map((n) => n.lon);
+      const bounds = new TMap.LatLngBounds(
+        new TMap.LatLng(Math.min(...lats), Math.min(...lons)),
+        new TMap.LatLng(Math.max(...lats), Math.max(...lons)),
+      );
+      mapRef.current?.fitBounds(bounds, { padding: 70 });
+    }, [animation, mapReady, selectedDay]);
 
     // Expose flyTo
     useImperativeHandle(
@@ -308,6 +645,10 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
           const TMap = window.TMap;
           const map = mapRef.current;
           if (!map || !TMap) return;
+          const targetCenter = toLatLng(TMap, lon, lat);
+          if (!targetCenter) {
+            return;
+          }
 
           const node = animation?.nodes.find(
             (n) => n.day === day && n.step_index === stepIndex,
@@ -330,18 +671,18 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
               {
                 id: "current",
                 styleId: "hl",
-                position: new TMap.LatLng(lat, lon),
+                position: targetCenter,
               },
             ]);
           }
 
-          // Smooth animated pan + zoom
-          const targetZoom = 15;
+          // Smooth animated pan only (keep current zoom level locked).
+          const targetZoom =
+            typeof map.getZoom === "function" ? map.getZoom() : 12;
           if (typeof map.easeTo === "function") {
             // TMap GL JS native smooth transition
             map.easeTo({
-              center: new TMap.LatLng(lat, lon),
-              zoom: targetZoom,
+              center: targetCenter,
               duration: 700,
             });
           } else {
@@ -352,6 +693,8 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
               typeof map.getZoom === "function" ? map.getZoom() : targetZoom;
             const startLat = startCenter ? startCenter.getLat() : lat;
             const startLon = startCenter ? startCenter.getLng() : lon;
+            const targetLat = targetCenter.getLat();
+            const targetLon = targetCenter.getLng();
             const duration = 700;
             const t0 = performance.now();
             const easeInOut = (t: number) =>
@@ -361,8 +704,8 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
               if (typeof map.setCenter === "function")
                 map.setCenter(
                   new TMap.LatLng(
-                    startLat + (lat - startLat) * p,
-                    startLon + (lon - startLon) * p,
+                    startLat + (targetLat - startLat) * p,
+                    startLon + (targetLon - startLon) * p,
                   ),
                 );
               if (typeof map.setZoom === "function")
