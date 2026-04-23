@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import plan, cases, status
+from .routers import plan, cases, status, route
 
 app = FastAPI(title="Travel Multi-Agent Planner API", version="1.0.0")
 
@@ -24,6 +24,7 @@ app.add_middleware(
 app.include_router(plan.router)
 app.include_router(cases.router)
 app.include_router(status.router)
+app.include_router(route.router)
 
 
 @app.get("/api/health")

@@ -3,12 +3,15 @@ import { createPortal } from "react-dom";
 import { Calendar, FileDown, ShieldCheck, Target, X } from "lucide-react";
 import type {
   AgentTraceStep,
-  AnimationSegment,
   AnimationStep,
   SourceEvidence,
   PlanResponse,
+  RoutePlanLeg,
+  RoutePlanResponse,
+  RouteTransportMode,
   TransportSegment,
 } from "../types/api";
+import { fetchRoutePlan } from "../api/client";
 import {
   translateNoteStyle,
   translateEvidenceType,
@@ -72,25 +75,23 @@ function summarizeStepTransport(step: AnimationStep) {
   return `${step.next_transport_type} · ${detailParts.join(" · ")}`;
 }
 
-function computeSegmentPlaybackMs(
-  segment: AnimationSegment | null,
+function computeLegPlaybackMs(
+  leg: RoutePlanLeg | null,
   speed: "slow" | "normal" | "fast",
 ): number {
-  const baseMs = { slow: 2600, normal: 1700, fast: 1100 }[speed];
-  if (!segment) {
-    return Math.round(baseMs * 0.95);
+  const rangeBySpeed = {
+    slow: { min: 3200, max: 32000, factor: 1.35 },
+    normal: { min: 2200, max: 22000, factor: 1 },
+    fast: { min: 1400, max: 15000, factor: 0.72 },
+  }[speed];
+  if (!leg) {
+    return rangeBySpeed.min;
   }
-  const durationMinutes = Math.max(1, segment.duration || 0);
-  const distanceKm = Math.max(0.2, segment.distance_km || 0);
-  const pathPoints = Math.max(2, segment.path?.length || 0);
-
-  const durationFactor = Math.max(0.7, Math.min(4.5, durationMinutes / 6));
-  const distanceFactor = Math.max(0.7, Math.min(4.5, distanceKm / 2.5));
-  const pathFactor = Math.max(0.7, Math.min(3.5, pathPoints / 22));
-  const factor = durationFactor * 0.5 + distanceFactor * 0.35 + pathFactor * 0.15;
-
+  const distanceBased = Math.max(0.2, leg.distance_km || 0) * 4200;
+  const durationBased = Math.max(1, leg.duration_minutes || 0) * 1000;
+  const mixed = (distanceBased * 0.6 + durationBased * 0.4) * rangeBySpeed.factor;
   return Math.round(
-    Math.max(baseMs * 0.8, Math.min(baseMs * 6, baseMs * factor)),
+    Math.max(rangeBySpeed.min, Math.min(rangeBySpeed.max, mixed)),
   );
 }
 
@@ -190,9 +191,14 @@ export default function ResultView({ result }: Props) {
   const [isMapPlaying, setIsMapPlaying] = useState(false);
   const [hasMapPlaybackStarted, setHasMapPlaybackStarted] = useState(false);
   const [mapSegmentProgress, setMapSegmentProgress] = useState(0);
+  const [mapTransportMode, setMapTransportMode] =
+    useState<RouteTransportMode>("driving");
   const [mapPlaySpeed, setMapPlaySpeed] = useState<"slow" | "normal" | "fast">(
     "normal",
   );
+  const [routePlan, setRoutePlan] = useState<RoutePlanResponse | null>(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const mapRef = useRef<TripMapHandle>(null);
 
   const { plan, animation } = result;
@@ -203,30 +209,116 @@ export default function ResultView({ result }: Props) {
       ? animation.steps.filter((s) => s.day === mapDay)
       : animation.steps;
   }, [animation, mapDay]);
-  const filteredAnimSegments = useMemo(() => {
-    if (!animation) return [];
-    return mapDay != null
-      ? animation.segments.filter((s) => s.day === mapDay)
-      : animation.segments;
-  }, [animation, mapDay]);
-  const segmentLookup = useMemo(() => {
-    const lookup = new Map<string, AnimationSegment>();
-    for (const segment of filteredAnimSegments) {
-      lookup.set(`${segment.day}-${segment.step_index}`, segment);
+  const stepNodeLookup = useMemo(() => {
+    const lookup = new Map<string, { lat: number; lon: number; title: string }>();
+    for (const node of animation?.nodes ?? []) {
+      lookup.set(`${node.day}-${node.step_index}`, node);
     }
     return lookup;
-  }, [filteredAnimSegments]);
-  const currentAnimatingSegment = useMemo(() => {
-    const step = filteredAnimSteps[mapStepIndex];
-    if (!step) return null;
-    return segmentLookup.get(`${step.day}-${step.step_index}`) ?? null;
-  }, [filteredAnimSteps, mapStepIndex, segmentLookup]);
-  const currentSegmentPlaybackMs = useMemo(
-    () => computeSegmentPlaybackMs(currentAnimatingSegment, mapPlaySpeed),
-    [currentAnimatingSegment, mapPlaySpeed],
+  }, [animation?.nodes]);
+  const routeInputPoints = useMemo(() => {
+    return filteredAnimSteps
+      .map((step) => stepNodeLookup.get(`${step.day}-${step.step_index}`))
+      .filter(Boolean)
+      .reduce<Array<{ lat: number; lon: number; label: string }>>(
+        (acc, node) => {
+          if (!node) {
+            return acc;
+          }
+          const previous = acc[acc.length - 1];
+          if (
+            previous &&
+            Math.abs(previous.lat - node.lat) < 1e-6 &&
+            Math.abs(previous.lon - node.lon) < 1e-6
+          ) {
+            return acc;
+          }
+          acc.push({
+            lat: node.lat,
+            lon: node.lon,
+            label: node.title,
+          });
+          return acc;
+        },
+        [],
+      );
+  }, [filteredAnimSteps, stepNodeLookup]);
+  const routeInputSignature = useMemo(
+    () =>
+      routeInputPoints
+        .map((point) => `${point.lat.toFixed(6)},${point.lon.toFixed(6)}`)
+        .join("|"),
+    [routeInputPoints],
   );
+  const currentRouteLeg = useMemo(() => {
+    if (!routePlan?.legs?.length) {
+      return null;
+    }
+    if (mapStepIndex < 0 || mapStepIndex >= routePlan.legs.length) {
+      return null;
+    }
+    return routePlan.legs[mapStepIndex];
+  }, [routePlan, mapStepIndex]);
+  const currentSegmentPlaybackMs = useMemo(
+    () => computeLegPlaybackMs(currentRouteLeg, mapPlaySpeed),
+    [currentRouteLeg, mapPlaySpeed],
+  );
+  const routeWarningsText = useMemo(() => {
+    if (!routePlan?.warnings?.length) {
+      return "";
+    }
+    return routePlan.warnings.slice(0, 2).join("; ");
+  }, [routePlan?.warnings]);
 
   const currentAnimStep = filteredAnimSteps[mapStepIndex] || null;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (routeInputPoints.length < 2) {
+      setRoutePlan(null);
+      setRouteError(null);
+      setRouteLoading(false);
+      return;
+    }
+
+    setRouteLoading(true);
+    setRouteError(null);
+    fetchRoutePlan({
+      mode: mapTransportMode,
+      points: routeInputPoints,
+      prefer_waypoints: true,
+    })
+      .then((response) => {
+        if (cancelled) {
+          return;
+        }
+        setRoutePlan(response);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        setRoutePlan(null);
+        setRouteError(err instanceof Error ? err.message : "路线规划失败");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRouteLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mapTransportMode, routeInputSignature, routeInputPoints]);
+
+  useEffect(() => {
+    const maxIndex = Math.max(0, filteredAnimSteps.length - 1);
+    if (mapStepIndex > maxIndex) {
+      setMapStepIndex(maxIndex);
+    }
+  }, [filteredAnimSteps.length, mapStepIndex]);
 
   // Prevent background content from scrolling/bleeding through when risk modal is open.
   useEffect(() => {
@@ -241,13 +333,13 @@ export default function ResultView({ result }: Props) {
     };
   }, [showRiskModal]);
 
-  // Reset step index when day filter changes
+  // Reset playback when day filter or transport mode changes
   useEffect(() => {
     setMapStepIndex(0);
     setIsMapPlaying(false);
     setHasMapPlaybackStarted(false);
     setMapSegmentProgress(0);
-  }, [mapDay]);
+  }, [mapDay, mapTransportMode]);
 
   // Playback timer
   useEffect(() => {
@@ -769,7 +861,8 @@ export default function ResultView({ result }: Props) {
                   </button>
                   <button
                     onClick={handleMapPlayPause}
-                    className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${
+                    disabled={routeLoading}
+                    className={`rounded-lg px-3 py-1.5 text-xs font-bold transition disabled:opacity-50 ${
                       isMapPlaying
                         ? "bg-amber-500 text-white hover:bg-amber-600"
                         : "bg-indigo-600 text-white hover:bg-indigo-700"
@@ -791,6 +884,18 @@ export default function ResultView({ result }: Props) {
                     重置
                   </button>
                   <select
+                    value={mapTransportMode}
+                    onChange={(e) =>
+                      setMapTransportMode(e.target.value as RouteTransportMode)
+                    }
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                  >
+                    <option value="driving">自驾/观光车</option>
+                    <option value="walking">步行</option>
+                    <option value="bicycling">骑行</option>
+                    <option value="transit">公共交通</option>
+                  </select>
+                  <select
                     value={mapPlaySpeed}
                     onChange={(e) =>
                       setMapPlaySpeed(
@@ -809,6 +914,17 @@ export default function ResultView({ result }: Props) {
                       : "0 / 0"}
                   </span>
                 </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {routeLoading
+                    ? "路线规划中..."
+                    : routeError
+                      ? `路线规划失败：${routeError}`
+                      : routePlan
+                        ? `导航模式：${mapTransportMode} · 状态：${routePlan.status}${
+                            routeWarningsText ? ` · ${routeWarningsText}` : ""
+                          }`
+                        : "未返回可用导航路线，将使用已有路径信息。"}
+                </div>
               </div>
 
               {/* Main content: map + side panel */}
@@ -821,6 +937,10 @@ export default function ResultView({ result }: Props) {
                     selectedDay={mapDay}
                     showRoutes={hasMapPlaybackStarted}
                     stepProgress={hasMapPlaybackStarted ? mapSegmentProgress : 0}
+                    routeLegs={routePlan?.legs ?? null}
+                    activeLegIndex={mapStepIndex}
+                    isPlaying={isMapPlaying}
+                    activeLegDurationMs={currentSegmentPlaybackMs}
                     activeStepKey={
                       currentAnimStep
                         ? {

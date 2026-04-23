@@ -5,7 +5,7 @@ import {
   forwardRef,
   useState,
 } from "react";
-import type { AnimationBundle } from "../types/api";
+import type { AnimationBundle, RoutePlanLeg } from "../types/api";
 import { fetchConfig } from "../api/client";
 
 declare global {
@@ -23,6 +23,7 @@ const DAY_COLORS = [
   "#0891b2",
   "#84cc16",
 ];
+
 const KIND_COLORS: Record<string, string> = {
   hotel: "#c2410c",
   spot: "#2563eb",
@@ -34,6 +35,7 @@ const KIND_COLORS: Record<string, string> = {
 function dayColor(day: number): string {
   return DAY_COLORS[(Math.max(1, day) - 1) % DAY_COLORS.length];
 }
+
 function nodeTypeColor(kind: string): string {
   return KIND_COLORS[kind] || "#475569";
 }
@@ -67,35 +69,50 @@ function highlightSvg(fill: string): string {
   );
 }
 
-// Singleton SDK loader
-let _sdkState: "idle" | "loading" | "ready" = "idle";
-const _sdkWaiters: Array<() => void> = [];
+function travelerSvg(fill: string): string {
+  return (
+    "data:image/svg+xml;charset=UTF-8," +
+    encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">` +
+        `<circle cx="22" cy="22" r="16" fill="${fill}" opacity=".92" />` +
+        `<path d="M16 21h9.5l-2.8-2.8 1.6-1.6 5.5 5.4-5.5 5.5-1.6-1.6 2.8-2.9H16z" fill="#fff"/>` +
+        `</svg>`,
+    )
+  );
+}
+
+let sdkState: "idle" | "loading" | "ready" = "idle";
+const sdkWaiters: Array<() => void> = [];
 
 function loadTencentSDK(key: string): Promise<void> {
   return new Promise((resolve) => {
-    if (_sdkState === "ready" && window.TMap) {
+    if (sdkState === "ready" && window.TMap) {
       resolve();
       return;
     }
-    _sdkWaiters.push(resolve);
-    if (_sdkState === "loading") return;
-    _sdkState = "loading";
+    sdkWaiters.push(resolve);
+    if (sdkState === "loading") {
+      return;
+    }
+    sdkState = "loading";
     const script = document.createElement("script");
     script.src = `https://map.qq.com/api/gljs?v=1.exp&key=${encodeURIComponent(key)}`;
     script.onload = () => {
-      _sdkState = "ready";
-      _sdkWaiters.splice(0).forEach((cb) => cb());
+      sdkState = "ready";
+      sdkWaiters.splice(0).forEach((cb) => cb());
     };
     script.onerror = () => {
-      _sdkState = "idle";
-      _sdkWaiters.splice(0);
+      sdkState = "idle";
+      sdkWaiters.splice(0);
     };
     document.head.appendChild(script);
   });
 }
 
 function applyGeometries(layer: any, geometries: any[]) {
-  if (!layer) return;
+  if (!layer) {
+    return;
+  }
   try {
     if (typeof layer.setGeometries === "function") {
       layer.setGeometries(geometries);
@@ -105,8 +122,9 @@ function applyGeometries(layer: any, geometries: any[]) {
     /* ignore */
   }
   try {
-    if (typeof layer.updateGeometries === "function")
+    if (typeof layer.updateGeometries === "function") {
       layer.updateGeometries(geometries);
+    }
   } catch (_) {
     /* ignore */
   }
@@ -140,6 +158,17 @@ function segmentDistanceMeters(
       Math.sin(dLon / 2) *
       Math.sin(dLon / 2);
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function pathDistanceKm(path: [number, number][]): number {
+  if (!Array.isArray(path) || path.length < 2) {
+    return 0;
+  }
+  let meters = 0;
+  for (let i = 1; i < path.length; i += 1) {
+    meters += segmentDistanceMeters(path[i - 1], path[i]);
+  }
+  return meters / 1000;
 }
 
 function locatePathProgress(
@@ -207,6 +236,22 @@ function partialPath(
   return visible;
 }
 
+function remainingPath(
+  path: [number, number][],
+  progress: number,
+): [number, number][] {
+  if (!Array.isArray(path) || path.length < 2) {
+    return [];
+  }
+  const located = locatePathProgress(path, progress);
+  if (!located) {
+    return path;
+  }
+  const remain: [number, number][] = [located.point];
+  remain.push(...path.slice(located.index + 1));
+  return remain.length >= 2 ? remain : path.slice(-2);
+}
+
 function currentPosition(
   path: [number, number][],
   progress: number,
@@ -263,19 +308,19 @@ function normalizePathPoint(
     return null;
   }
 
-  // Legacy fallback: bad decode left Tencent deltas undecoded (e.g. [3, -150]).
-  if (
-    prev &&
-    Math.abs(x) <= 1_000_000 &&
-    Math.abs(y) <= 1_000_000
-  ) {
-    const candidate: [number, number] = [prev[0] + x / 1_000_000, prev[1] + y / 1_000_000];
-    if (isValidLonLat(candidate[0], candidate[1]) && isLocallyContinuous(prev, candidate)) {
+  if (prev && Math.abs(x) <= 1_000_000 && Math.abs(y) <= 1_000_000) {
+    const candidate: [number, number] = [
+      prev[0] + x / 1_000_000,
+      prev[1] + y / 1_000_000,
+    ];
+    if (
+      isValidLonLat(candidate[0], candidate[1]) &&
+      isLocallyContinuous(prev, candidate)
+    ) {
       return candidate;
     }
   }
 
-  // Swap fallback only if it remains locally continuous to avoid huge jumps.
   if (isValidLonLat(y, x)) {
     const swapped: [number, number] = [y, x];
     if (!prev || isLocallyContinuous(prev, swapped)) {
@@ -306,16 +351,37 @@ function sanitizePath(path: [number, number][]): [number, number][] {
   return cleaned;
 }
 
-function toLatLng(
-  TMap: any,
-  lonRaw: number,
-  latRaw: number,
-): any | null {
+function toLatLng(TMap: any, lonRaw: number, latRaw: number): any | null {
   const normalized = normalizeLonLatPoint([lonRaw, latRaw]);
   if (!normalized) {
     return null;
   }
   return new TMap.LatLng(normalized[1], normalized[0]);
+}
+
+function callLayerMethod(layer: any, methods: string[]): boolean {
+  for (const method of methods) {
+    try {
+      if (typeof layer?.[method] === "function") {
+        layer[method]();
+        return true;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return false;
+}
+
+function stopMarkerMove(layer: any) {
+  callLayerMethod(layer, ["stopMove", "stopMoving", "clearMove", "stop"]);
+}
+
+function pauseMarkerMove(layer: any) {
+  const paused = callLayerMethod(layer, ["pauseMove"]);
+  if (!paused) {
+    stopMarkerMove(layer);
+  }
 }
 
 export interface TripMapHandle {
@@ -328,6 +394,10 @@ interface Props {
   activeStepKey?: { day: number; stepIndex: number } | null;
   showRoutes?: boolean;
   stepProgress?: number;
+  routeLegs?: RoutePlanLeg[] | null;
+  activeLegIndex?: number;
+  isPlaying?: boolean;
+  activeLegDurationMs?: number;
 }
 
 const TripMapView = forwardRef<TripMapHandle, Props>(
@@ -338,6 +408,10 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       activeStepKey,
       showRoutes = false,
       stepProgress = 0,
+      routeLegs,
+      activeLegIndex = 0,
+      isPlaying = false,
+      activeLegDurationMs = 2200,
     },
     ref,
   ) => {
@@ -346,16 +420,19 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
     const segLayerRef = useRef<any>(null);
     const nodeLayerRef = useRef<any>(null);
     const hlLayerRef = useRef<any>(null);
+    const movingLayerRef = useRef<any>(null);
     const lastFitKeyRef = useRef("");
+    const movingRunKeyRef = useRef("");
     const [mapReady, setMapReady] = useState(false);
 
-    // Load SDK and init map on mount
     useEffect(() => {
       let cancelled = false;
 
       fetchConfig()
         .then(({ tencent_map_js_key }) => {
-          if (cancelled || !tencent_map_js_key) return;
+          if (cancelled || !tencent_map_js_key) {
+            return;
+          }
           return loadTencentSDK(tencent_map_js_key);
         })
         .then(() => {
@@ -364,8 +441,9 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
             !containerRef.current ||
             mapRef.current ||
             !window.TMap
-          )
+          ) {
             return;
+          }
           const TMap = window.TMap;
 
           const map = new TMap.Map(containerRef.current, {
@@ -391,6 +469,18 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
             styles: {},
             geometries: [],
           });
+          movingLayerRef.current = new TMap.MultiMarker({
+            map,
+            styles: {
+              traveler: new TMap.MarkerStyle({
+                width: 40,
+                height: 40,
+                anchor: { x: 20, y: 20 },
+                src: travelerSvg("#f59e0b"),
+              }),
+            },
+            geometries: [],
+          });
 
           setMapReady(true);
         })
@@ -399,6 +489,7 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       return () => {
         cancelled = true;
         try {
+          stopMarkerMove(movingLayerRef.current);
           mapRef.current?.destroy?.();
         } catch (_) {
           /* ignore */
@@ -408,10 +499,11 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       };
     }, []);
 
-    // Lock map zoom interactions (wheel / double-click / pinch) for presentation mode.
     useEffect(() => {
       const container = containerRef.current;
-      if (!container) return;
+      if (!container) {
+        return;
+      }
       const preventWheel = (event: WheelEvent) => {
         event.preventDefault();
       };
@@ -434,61 +526,51 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       };
     }, []);
 
-    // Draw animation whenever map or playback progress changes.
     useEffect(() => {
-      if (!mapReady || !animation || !window.TMap) return;
+      if (!mapReady || !animation || !window.TMap) {
+        return;
+      }
       const TMap = window.TMap;
       const nodes =
         selectedDay != null
-          ? animation.nodes.filter((n) => n.day === selectedDay)
+          ? animation.nodes.filter((node) => node.day === selectedDay)
           : animation.nodes;
-      const segments =
+      const animSegments =
         selectedDay != null
-          ? animation.segments.filter((s) => s.day === selectedDay)
+          ? animation.segments.filter((segment) => segment.day === selectedDay)
           : animation.segments;
+
       const normalizedProgress = Math.max(0, Math.min(1, stepProgress));
       const activeDay = activeStepKey?.day;
       const activeStepIndex = activeStepKey?.stepIndex;
+      const hasRouteLegs = Array.isArray(routeLegs) && routeLegs.length > 0;
 
-      // --- Polylines (only revealed route up to current moving position) ---
       const segStyles: Record<string, any> = {};
       const segGeoms: any[] = [];
-      if (showRoutes && activeDay != null && activeStepIndex != null) {
-        segments
-          .filter((segment) => Array.isArray(segment.path) && segment.path.length >= 2)
-          .forEach((segment, idx) => {
-            const safePath = sanitizePath(segment.path);
+      if (showRoutes) {
+        if (hasRouteLegs) {
+          routeLegs.forEach((leg, index) => {
+            if (index > activeLegIndex) {
+              return;
+            }
+            const safePath = sanitizePath(leg.path);
             if (safePath.length < 2) {
               return;
             }
-            const order = compareStepKey(
-              segment.day,
-              segment.step_index,
-              activeDay,
-              activeStepIndex,
-            );
-            let progress = 0;
-            if (order < 0) {
-              progress = 1;
-            } else if (order === 0) {
-              progress = normalizedProgress;
-            }
-            if (order > 0) {
-              return;
-            }
+            const progress = index < activeLegIndex ? 1 : normalizedProgress;
             const clippedPath = partialPath(safePath, progress);
             if (clippedPath.length < 2) {
               return;
             }
             const latLngPath = clippedPath
-              .map(([lon, lat]: [number, number]) => toLatLng(TMap, lon, lat))
+              .map(([lon, lat]) => toLatLng(TMap, lon, lat))
               .filter(Boolean);
             if (latLngPath.length < 2) {
               return;
             }
-            const id = `seg-${idx}`;
+            const id = `route-leg-${index}`;
             segStyles[id] = new TMap.PolylineStyle({
-              color: segment.color || "#6366f1",
+              color: dayColor(index + 1),
               width: 7,
               borderWidth: 0,
               lineCap: "round",
@@ -499,7 +581,58 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
               paths: latLngPath,
             });
           });
+        } else if (activeDay != null && activeStepIndex != null) {
+          animSegments
+            .filter(
+              (segment) =>
+                Array.isArray(segment.path) && segment.path.length >= 2,
+            )
+            .forEach((segment, index) => {
+              const safePath = sanitizePath(segment.path);
+              if (safePath.length < 2) {
+                return;
+              }
+              const order = compareStepKey(
+                segment.day,
+                segment.step_index,
+                activeDay,
+                activeStepIndex,
+              );
+              let progress = 0;
+              if (order < 0) {
+                progress = 1;
+              } else if (order === 0) {
+                progress = normalizedProgress;
+              }
+              if (order > 0) {
+                return;
+              }
+              const clippedPath = partialPath(safePath, progress);
+              if (clippedPath.length < 2) {
+                return;
+              }
+              const latLngPath = clippedPath
+                .map(([lon, lat]) => toLatLng(TMap, lon, lat))
+                .filter(Boolean);
+              if (latLngPath.length < 2) {
+                return;
+              }
+              const id = `seg-${index}`;
+              segStyles[id] = new TMap.PolylineStyle({
+                color: segment.color || "#6366f1",
+                width: 7,
+                borderWidth: 0,
+                lineCap: "round",
+              });
+              segGeoms.push({
+                id,
+                styleId: id,
+                paths: latLngPath,
+              });
+            });
+        }
       }
+
       if (segLayerRef.current) {
         if (typeof segLayerRef.current.setStyles === "function") {
           segLayerRef.current.setStyles(segStyles);
@@ -507,17 +640,16 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
         applyGeometries(segLayerRef.current, segGeoms);
       }
 
-      // --- Markers ---
       const markerStyles: Record<string, any> = {};
       const markerGeoms: any[] = [];
-      nodes.forEach((node, idx) => {
+      nodes.forEach((node, index) => {
         const nodeLatLng = toLatLng(TMap, node.lon, node.lat);
         if (!nodeLatLng) {
           return;
         }
         const fill = node.type_color || nodeTypeColor(node.kind);
         const outline = node.day_color || dayColor(node.day);
-        const id = `node-${idx}`;
+        const id = `node-${index}`;
         markerStyles[id] = new TMap.MarkerStyle({
           width: 38,
           height: 48,
@@ -537,40 +669,48 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
         applyGeometries(nodeLayerRef.current, markerGeoms);
       }
 
-      // Highlight active step node or moving position on current segment.
+      const shouldHideHighlight = hasRouteLegs && isPlaying && showRoutes;
+      if (shouldHideHighlight) {
+        applyGeometries(hlLayerRef.current, []);
+        return;
+      }
+
       if (activeStepKey && hlLayerRef.current) {
         const activeNode = nodes.find(
-          (n) =>
-            n.day === activeStepKey.day &&
-            n.step_index === activeStepKey.stepIndex,
+          (node) =>
+            node.day === activeStepKey.day &&
+            node.step_index === activeStepKey.stepIndex,
         );
-        const currentSegment =
-          activeDay != null && activeStepIndex != null
-            ? segments.find(
-                (segment) =>
-                  segment.day === activeDay &&
-                  segment.step_index === activeStepIndex &&
-                  Array.isArray(segment.path) &&
-                  segment.path.length >= 2,
-              )
-            : undefined;
-        const currentSegmentPath = currentSegment
-          ? sanitizePath(currentSegment.path)
-          : [];
-        const movingPoint =
-          showRoutes && currentSegmentPath.length >= 2
-            ? currentPosition(currentSegmentPath, normalizedProgress)
-            : null;
+        let movingPoint: [number, number] | null = null;
+        if (hasRouteLegs) {
+          const legPath = sanitizePath(routeLegs[activeLegIndex]?.path ?? []);
+          if (showRoutes && legPath.length >= 2) {
+            movingPoint = currentPosition(legPath, normalizedProgress);
+          }
+        } else if (activeDay != null && activeStepIndex != null) {
+          const currentSegment = animSegments.find(
+            (segment) =>
+              segment.day === activeDay &&
+              segment.step_index === activeStepIndex &&
+              Array.isArray(segment.path) &&
+              segment.path.length >= 2,
+          );
+          const currentSegmentPath = currentSegment
+            ? sanitizePath(currentSegment.path)
+            : [];
+          if (showRoutes && currentSegmentPath.length >= 2) {
+            movingPoint = currentPosition(currentSegmentPath, normalizedProgress);
+          }
+        }
+
         const markerLon = movingPoint?.[0] ?? activeNode?.lon;
         const markerLat = movingPoint?.[1] ?? activeNode?.lat;
         const markerLatLng =
           typeof markerLon === "number" && typeof markerLat === "number"
             ? toLatLng(TMap, markerLon, markerLat)
             : null;
-        if (
-          activeNode &&
-          markerLatLng
-        ) {
+
+        if (activeNode && markerLatLng) {
           const fill = activeNode.type_color || nodeTypeColor(activeNode.kind);
           if (typeof hlLayerRef.current.setStyles === "function") {
             hlLayerRef.current.setStyles({
@@ -602,34 +742,140 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       activeStepKey,
       showRoutes,
       stepProgress,
+      routeLegs,
+      activeLegIndex,
+      isPlaying,
     ]);
 
-    // Fit bounds only when day filter/data changes, not during each progress tick.
     useEffect(() => {
-      if (!mapReady || !animation || !window.TMap) return;
+      if (!mapReady || !window.TMap || !movingLayerRef.current) {
+        return;
+      }
+      const TMap = window.TMap;
+      const layer = movingLayerRef.current;
+      const hasRouteLegs = Array.isArray(routeLegs) && routeLegs.length > 0;
+
+      if (
+        !hasRouteLegs ||
+        !showRoutes ||
+        activeLegIndex < 0 ||
+        activeLegIndex >= routeLegs.length
+      ) {
+        stopMarkerMove(layer);
+        applyGeometries(layer, []);
+        movingRunKeyRef.current = "";
+        return;
+      }
+
+      if (!isPlaying) {
+        pauseMarkerMove(layer);
+        movingRunKeyRef.current = "";
+        return;
+      }
+
+      const runKey = `${activeLegIndex}:${activeLegDurationMs}`;
+      if (movingRunKeyRef.current === runKey) {
+        return;
+      }
+      movingRunKeyRef.current = runKey;
+
+      const progress = Math.max(0, Math.min(1, stepProgress));
+      const legPath = sanitizePath(routeLegs[activeLegIndex].path);
+      const remainPath = remainingPath(legPath, progress);
+      if (remainPath.length < 2) {
+        return;
+      }
+      const latLngPath = remainPath
+        .map(([lon, lat]) => toLatLng(TMap, lon, lat))
+        .filter(Boolean);
+      if (latLngPath.length < 2) {
+        return;
+      }
+      if (typeof layer.setStyles === "function") {
+        layer.setStyles({
+          traveler: new TMap.MarkerStyle({
+            width: 40,
+            height: 40,
+            anchor: { x: 20, y: 20 },
+            src: travelerSvg("#f59e0b"),
+          }),
+        });
+      }
+      applyGeometries(layer, [
+        {
+          id: "traveler",
+          styleId: "traveler",
+          position: latLngPath[0],
+        },
+      ]);
+      stopMarkerMove(layer);
+
+      const remainingDurationMs = Math.max(
+        900,
+        Math.round(activeLegDurationMs * (1 - progress)),
+      );
+      const remainingDistanceKm = Math.max(0.02, pathDistanceKm(remainPath));
+      const speedKmh = Math.max(
+        4,
+        Math.min(110, remainingDistanceKm / (remainingDurationMs / 3_600_000)),
+      );
+
+      try {
+        if (typeof layer.moveAlong === "function") {
+          layer.moveAlong(
+            {
+              traveler: {
+                path: latLngPath,
+                speed: speedKmh,
+              },
+            },
+            { autoRotation: true },
+          );
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }, [
+      mapReady,
+      routeLegs,
+      activeLegIndex,
+      isPlaying,
+      showRoutes,
+      activeLegDurationMs,
+      stepProgress,
+    ]);
+
+    useEffect(() => {
+      if (!mapReady || !animation || !window.TMap) {
+        return;
+      }
       const TMap = window.TMap;
       const nodes =
         selectedDay != null
-          ? animation.nodes.filter((n) => n.day === selectedDay)
+          ? animation.nodes.filter((node) => node.day === selectedDay)
           : animation.nodes;
       const validNodes = nodes
         .map((node) => {
           const normalized = normalizeLonLatPoint([node.lon, node.lat]);
-          return normalized ? { node, lon: normalized[0], lat: normalized[1] } : null;
+          return normalized
+            ? { node, lon: normalized[0], lat: normalized[1] }
+            : null;
         })
         .filter(Boolean) as Array<{
         node: (typeof nodes)[number];
         lon: number;
         lat: number;
       }>;
-      if (!validNodes.length) return;
+      if (!validNodes.length) {
+        return;
+      }
       const fitKey = `${animation.case_id}|${selectedDay ?? "all"}|${nodes.length}`;
       if (lastFitKeyRef.current === fitKey) {
         return;
       }
       lastFitKeyRef.current = fitKey;
-      const lats = validNodes.map((n) => n.lat);
-      const lons = validNodes.map((n) => n.lon);
+      const lats = validNodes.map((node) => node.lat);
+      const lons = validNodes.map((node) => node.lon);
       const bounds = new TMap.LatLngBounds(
         new TMap.LatLng(Math.min(...lats), Math.min(...lons)),
         new TMap.LatLng(Math.max(...lats), Math.max(...lons)),
@@ -637,25 +883,25 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
       mapRef.current?.fitBounds(bounds, { padding: 70 });
     }, [animation, mapReady, selectedDay]);
 
-    // Expose flyTo
     useImperativeHandle(
       ref,
       () => ({
         flyTo(lat: number, lon: number, day: number, stepIndex: number) {
           const TMap = window.TMap;
           const map = mapRef.current;
-          if (!map || !TMap) return;
+          if (!map || !TMap) {
+            return;
+          }
           const targetCenter = toLatLng(TMap, lon, lat);
           if (!targetCenter) {
             return;
           }
 
           const node = animation?.nodes.find(
-            (n) => n.day === day && n.step_index === stepIndex,
+            (item) => item.day === day && item.step_index === stepIndex,
           );
           const fill = node?.type_color || nodeTypeColor(node?.kind ?? "spot");
 
-          // Update highlight layer
           if (hlLayerRef.current) {
             if (typeof hlLayerRef.current.setStyles === "function") {
               hlLayerRef.current.setStyles({
@@ -676,44 +922,39 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
             ]);
           }
 
-          // Smooth animated pan only (keep current zoom level locked).
-          const targetZoom =
-            typeof map.getZoom === "function" ? map.getZoom() : 12;
           if (typeof map.easeTo === "function") {
-            // TMap GL JS native smooth transition
             map.easeTo({
               center: targetCenter,
               duration: 700,
             });
-          } else {
-            // Fallback: manual rAF lerp over 700ms
-            const startCenter =
-              typeof map.getCenter === "function" ? map.getCenter() : null;
-            const startZoom =
-              typeof map.getZoom === "function" ? map.getZoom() : targetZoom;
-            const startLat = startCenter ? startCenter.getLat() : lat;
-            const startLon = startCenter ? startCenter.getLng() : lon;
-            const targetLat = targetCenter.getLat();
-            const targetLon = targetCenter.getLng();
-            const duration = 700;
-            const t0 = performance.now();
-            const easeInOut = (t: number) =>
-              t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-            const tick = (now: number) => {
-              const p = easeInOut(Math.min((now - t0) / duration, 1));
-              if (typeof map.setCenter === "function")
-                map.setCenter(
-                  new TMap.LatLng(
-                    startLat + (targetLat - startLat) * p,
-                    startLon + (targetLon - startLon) * p,
-                  ),
-                );
-              if (typeof map.setZoom === "function")
-                map.setZoom(startZoom + (targetZoom - startZoom) * p);
-              if (p < 1) requestAnimationFrame(tick);
-            };
-            requestAnimationFrame(tick);
+            return;
           }
+
+          const startCenter =
+            typeof map.getCenter === "function" ? map.getCenter() : null;
+          const startLat = startCenter ? startCenter.getLat() : lat;
+          const startLon = startCenter ? startCenter.getLng() : lon;
+          const targetLat = targetCenter.getLat();
+          const targetLon = targetCenter.getLng();
+          const duration = 700;
+          const t0 = performance.now();
+          const easeInOut = (t: number) =>
+            t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+          const tick = (now: number) => {
+            const p = easeInOut(Math.min((now - t0) / duration, 1));
+            if (typeof map.setCenter === "function") {
+              map.setCenter(
+                new TMap.LatLng(
+                  startLat + (targetLat - startLat) * p,
+                  startLon + (targetLon - startLon) * p,
+                ),
+              );
+            }
+            if (p < 1) {
+              requestAnimationFrame(tick);
+            }
+          };
+          requestAnimationFrame(tick);
         },
       }),
       [animation, mapReady],
@@ -730,3 +971,4 @@ const TripMapView = forwardRef<TripMapHandle, Props>(
 
 TripMapView.displayName = "TripMapView";
 export default TripMapView;
+
