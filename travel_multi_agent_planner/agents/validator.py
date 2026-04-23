@@ -1,18 +1,8 @@
 from __future__ import annotations
 
+import re
+
 from ..models import BudgetSummary, CityMatch, DayPlan, TravelConstraints, TripRequest, ValidationIssue
-from ..scheduling import (
-    DINNER_START_MAX_MINUTES,
-    DINNER_START_MINUTES,
-    INTERCITY_ARRIVAL_BUFFER_MINUTES,
-    INTERCITY_DEPARTURE_BUFFER_MINUTES,
-    LUNCH_START_MAX_MINUTES,
-    LUNCH_START_MINUTES,
-    build_scheduled_day_timeline,
-    parse_clock,
-    segment_arrival_minutes,
-    segment_departure_minutes,
-)
 
 
 class ConstraintValidatorAgent:
@@ -44,27 +34,90 @@ class ConstraintValidatorAgent:
                     category="budget",
                     message=f"当前方案超出预算 {abs(budget_summary.remaining_budget):.0f} 元。",
                     day=None,
-                    suggested_fix="减少付费景点、降低住宿和餐饮档位，优先保留核心景点。",
+                    suggested_fix="减少付费景点、住宿或餐饮档位，优先保留核心景点。",
                 )
             )
 
-        intercity_lines = [line for line in budget_summary.lines if line.category == "城际交通"]
-        if not intercity_lines:
+        if not any(line.category == "城际交通" for line in budget_summary.lines):
             issues.append(
                 ValidationIssue(
                     severity="high",
                     category="intercity-budget-missing",
                     message="预算中缺少出发地与目的地往返交通费用。",
                     day=None,
-                    suggested_fix="在预算汇总中明确加入城际往返交通，并与来往交通区保持一致。",
+                    suggested_fix="在预算汇总中加入城际往返交通，并与来往交通区保持一致。",
                 )
             )
 
+        all_spots = [spot for day in day_plans for spot in day.spots]
+        required_names = self._required_names(constraints)
+        for required_name in required_names:
+            if not any(self._is_required_match(spot.name, required_name) for spot in all_spots):
+                issues.append(
+                    ValidationIssue(
+                        severity="high",
+                        category="required-poi-missing",
+                        message=f"必达景点未命中：{required_name}。",
+                        day=None,
+                        suggested_fix="补充该景点检索并强制写入行程。",
+                    )
+                )
+
+        for day, required_spots in constraints.must_include_spots_by_day.items():
+            current_day = next((item for item in day_plans if item.day == day), None)
+            if current_day is None:
+                issues.append(
+                    ValidationIssue(
+                        severity="high",
+                        category="required-poi-day-missing",
+                        message=f"第 {day} 天未生成行程，无法满足按天必达景点要求。",
+                        day=day,
+                        suggested_fix="补齐该天行程并优先安排必达景点。",
+                    )
+                )
+                continue
+            for required_name in required_spots:
+                if not any(self._is_required_match(spot.name, required_name) for spot in current_day.spots):
+                    issues.append(
+                        ValidationIssue(
+                            severity="high",
+                            category="required-poi-day-missing",
+                            message=f"第 {day} 天未命中必达景点：{required_name}。",
+                            day=day,
+                            suggested_fix="将该景点固定安排到指定日期。",
+                        )
+                    )
+
+        if constraints.preferred_areas:
+            area_texts = [
+                f"{spot.name} {spot.district} {spot.address} {spot.description}".lower()
+                for spot in all_spots
+            ]
+            area_texts.extend(
+                f"{day.hotel.name} {day.hotel.district} {day.hotel.address}".lower()
+                for day in day_plans
+                if day.hotel is not None
+            )
+            for area in constraints.preferred_areas:
+                area_text = area.strip().lower()
+                if not area_text:
+                    continue
+                if not any(area_text in candidate for candidate in area_texts):
+                    issues.append(
+                        ValidationIssue(
+                            severity="high",
+                            category="preferred-area-missing",
+                            message=f"偏好区域/景点未命中：{area}。",
+                            day=None,
+                            suggested_fix="补充该区域相关景点或酒店并重新规划路线。",
+                        )
+                    )
+
+        avoid_tags = [tag.strip().lower() for tag in constraints.avoid_tags if tag.strip()]
         seen_restaurants: set[str] = set()
         seen_pois: set[str] = set()
         meal_prices: list[float] = []
         for day in day_plans:
-            scheduled = build_scheduled_day_timeline(day)
             if len(day.spots) > constraints.max_daily_spots:
                 issues.append(
                     ValidationIssue(
@@ -95,19 +148,30 @@ class ConstraintValidatorAgent:
                         category="hotel-missing",
                         message=f"第 {day.day} 天缺少酒店安排。",
                         day=day.day,
-                        suggested_fix="为当天补充酒店候选，并优先靠近景点聚集区。",
+                        suggested_fix="为当日补充酒店候选，并优先靠近景点聚集区。",
                     )
                 )
-            elif not day.hotel.source_evidence:
-                issues.append(
-                    ValidationIssue(
-                        severity="high",
-                        category="hotel-evidence",
-                        message=f"第 {day.day} 天酒店缺少真实来源证据。",
-                        day=day.day,
-                        suggested_fix="重新检索真实酒店候选。",
+            else:
+                if not day.hotel.source_evidence:
+                    issues.append(
+                        ValidationIssue(
+                            severity="high",
+                            category="hotel-evidence",
+                            message=f"第 {day.day} 天酒店缺少真实来源证据。",
+                            day=day.day,
+                            suggested_fix="重新检索真实酒店候选。",
+                        )
                     )
-                )
+                if request.must_have_hotel_area and not self._hotel_matches_area(day.hotel, request.must_have_hotel_area):
+                    issues.append(
+                        ValidationIssue(
+                            severity="high",
+                            category="hotel-area-mismatch",
+                            message=f"第 {day.day} 天酒店未命中偏好区域：{request.must_have_hotel_area}。",
+                            day=day.day,
+                            suggested_fix="更换到指定区域内酒店，保持酒店区域硬约束。",
+                        )
+                    )
 
             if len(day.meals) < 2:
                 issues.append(
@@ -119,65 +183,42 @@ class ConstraintValidatorAgent:
                         suggested_fix="补充午餐与晚餐，避免空白餐次。",
                     )
                 )
-                continue
-
-            lunch, dinner = day.meals[0], day.meals[1]
-            if lunch.venue_name == dinner.venue_name:
-                issues.append(
-                    ValidationIssue(
-                        severity="medium",
-                        category="meal-repeat",
-                        message=f"第 {day.day} 天午餐和晚餐使用了同一家餐厅。",
-                        day=day.day,
-                        suggested_fix="替换其中一餐为不同类型的本地馆子或夜游餐厅。",
-                    )
-                )
-
-            for meal in day.meals:
-                meal_prices.append(meal.estimated_cost)
-                meal_key = self._meal_key(meal)
-                if meal_key in seen_restaurants:
+            else:
+                lunch, dinner = day.meals[0], day.meals[1]
+                if lunch.venue_name == dinner.venue_name:
                     issues.append(
                         ValidationIssue(
-                            severity="low" if meal.fallback_used else "medium",
-                            category="cross-day-repeat",
-                            message=f"{meal.venue_name} 在多天行程中重复出现。{'当前为候选不足后的回退结果。' if meal.fallback_used else ''}",
+                            severity="medium",
+                            category="meal-repeat",
+                            message=f"第 {day.day} 天午餐和晚餐使用了同一家餐厅。",
                             day=day.day,
-                            suggested_fix="扩大沿路线餐饮候选池，优先改用路线 2 公里内的替代馆子。",
+                            suggested_fix="替换其中一餐为不同类型的本地馆子。",
                         )
                     )
-                seen_restaurants.add(meal_key)
-                if not meal.source_evidence:
-                    issues.append(
-                        ValidationIssue(
-                            severity="high",
-                            category="meal-evidence",
-                            message=f"第 {day.day} 天餐饮 {meal.venue_name} 缺少真实来源证据。",
-                            day=day.day,
-                            suggested_fix="重新检索真实餐饮候选。",
+                for meal in day.meals:
+                    meal_prices.append(meal.estimated_cost)
+                    meal_key = self._meal_key(meal)
+                    if meal_key in seen_restaurants:
+                        issues.append(
+                            ValidationIssue(
+                                severity="medium",
+                                category="cross-day-repeat",
+                                message=f"{meal.venue_name} 在多天行程中重复出现。",
+                                day=day.day,
+                                suggested_fix="扩展候选池并优先替换为沿途可达餐饮。",
+                            )
                         )
-                    )
-                if meal.fallback_used:
-                    issues.append(
-                        ValidationIssue(
-                            severity="low",
-                            category="meal-candidate-limited",
-                            message=f"第 {day.day} 天 {meal.venue_name} 使用了候选不足回退策略。",
-                            day=day.day,
-                            suggested_fix="继续扩充沿路线餐饮候选，优先使用距离主路线 1 公里内的店铺。",
+                    seen_restaurants.add(meal_key)
+                    if not meal.source_evidence:
+                        issues.append(
+                            ValidationIssue(
+                                severity="high",
+                                category="meal-evidence",
+                                message=f"第 {day.day} 天餐饮 {meal.venue_name} 缺少真实来源证据。",
+                                day=day.day,
+                                suggested_fix="重新检索真实餐饮候选。",
+                            )
                         )
-                    )
-                route_limit = 1.0 if meal.meal_type == "lunch" else 1.5
-                if meal.route_distance_km > route_limit:
-                    issues.append(
-                        ValidationIssue(
-                            severity="medium" if not meal.fallback_used else "low",
-                            category="meal-route-detour-too-far",
-                            message=f"第 {day.day} 天 {meal.venue_name} 距离当餐主路线约 {meal.route_distance_km:.1f} km，偏离主路线较远。",
-                            day=day.day,
-                            suggested_fix="优先改用距主路线 1 公里内的沿途餐饮，必要时再逐级放宽半径。",
-                        )
-                    )
 
             if not day.transport_segments:
                 issues.append(
@@ -189,153 +230,41 @@ class ConstraintValidatorAgent:
                         suggested_fix="为酒店、景点和餐饮节点补齐交通方式与耗时。",
                     )
                 )
-            total_transport_minutes = sum(segment.duration_minutes for segment in day.transport_segments)
-            if total_transport_minutes > 210:
-                issues.append(
-                    ValidationIssue(
-                        severity="high",
-                        category="transport-too-long",
-                        message=f"第 {day.day} 天市内交通总时长过长，当前约 {total_transport_minutes} 分钟。",
-                        day=day.day,
-                        suggested_fix="减少远距景点与绕路餐饮，把行程压回同一路径带内。",
-                    )
-                )
-            elif total_transport_minutes > 150:
-                issues.append(
-                    ValidationIssue(
-                        severity="medium",
-                        category="transport-too-long",
-                        message=f"第 {day.day} 天市内交通总时长偏长，当前约 {total_transport_minutes} 分钟。",
-                        day=day.day,
-                        suggested_fix="优先替换偏远景点，压缩同日跨区移动。",
-                    )
-                )
             if not day.transport.route_path:
                 issues.append(
                     ValidationIssue(
                         severity="medium",
                         category="map-missing",
-                        message=f"第 {day.day} 天地图缺少完整线路。",
+                        message=f"第 {day.day} 天地图缺少完整路线。",
                         day=day.day,
-                        suggested_fix="补充腾讯路径返回的线路数据。",
+                        suggested_fix="补充路径数据并重新生成地图。",
                     )
                 )
-            for segment in day.transport_segments:
-                if getattr(segment, "path_status", "ok") == "missing":
-                    issues.append(
-                        ValidationIssue(
-                            severity="medium",
-                            category="segment-path-missing",
-                            message=f"第 {day.day} 天 {segment.from_label} -> {segment.to_label} 缺少真实路径 polyline，当前未绘制替代直线。",
-                            day=day.day,
-                            suggested_fix="重新请求腾讯路线；若服务端仍无 polyline，则保留文本提示但不要渲染伪路线。",
-                        )
-                    )
-                elif len(segment.path) <= 2 and segment.distance_km > 3.0:
-                    issues.append(
-                        ValidationIssue(
-                            severity="medium",
-                            category="segment-illegal-straight-fallback",
-                            message=f"第 {day.day} 天 {segment.from_label} -> {segment.to_label} 仅返回近似直连路径，当前约 {segment.distance_km:.1f} km。",
-                            day=day.day,
-                            suggested_fix="优先使用腾讯真实 polyline；若仍缺失，则保留节点与说明，不再绘制直连线。",
-                        )
-                    )
-                if segment.distance_km > 25.0:
-                    issues.append(
-                        ValidationIssue(
-                            severity="high",
-                            category="segment-too-long",
-                            message=f"第 {day.day} 天 {segment.from_label} -> {segment.to_label} 交通段过长，当前约 {segment.distance_km:.1f} km。",
-                            day=day.day,
-                            suggested_fix="替换远端点位或重新聚类当日路线，避免把孤立景点与中心城区硬串联。",
-                        )
-                    )
-                elif segment.distance_km > 15.0:
-                    issues.append(
-                        ValidationIssue(
-                            severity="medium",
-                            category="segment-too-long",
-                            message=f"第 {day.day} 天 {segment.from_label} -> {segment.to_label} 交通段偏长，当前约 {segment.distance_km:.1f} km。",
-                            day=day.day,
-                            suggested_fix="优先压缩跨区段，把餐饮和景点调整到同一路径带内。",
-                        )
-                    )
 
-            meal_schedule = {row["kind"]: row for row in scheduled if row["kind"] in {"lunch", "dinner"}}
-            lunch_row = meal_schedule.get("lunch")
-            if lunch_row is not None:
-                lunch_start = parse_clock(lunch_row["start_time"]) or 0
-                if not (LUNCH_START_MINUTES <= lunch_start <= LUNCH_START_MAX_MINUTES):
-                    issues.append(
-                        ValidationIssue(
-                            severity="high",
-                            category="meal-window-lunch",
-                            message=f"第 {day.day} 天午餐开始时间为 {lunch_row['start_time']}，不在 11:30-13:30 窗口内。",
-                            day=day.day,
-                            suggested_fix="减少午餐前活动或把午餐前置，确保午餐落在 11:30-13:30 之间。",
-                        )
+            must_have_hits = sum(1 for spot in day.spots if set(spot.tags).intersection(constraints.must_have_tags))
+            if constraints.must_have_tags and must_have_hits == 0:
+                issues.append(
+                    ValidationIssue(
+                        severity="low",
+                        category="interest-match",
+                        message=f"第 {day.day} 天对用户核心兴趣覆盖不足。",
+                        day=day.day,
+                        suggested_fix="替换为更符合兴趣标签的景点。",
                     )
-            dinner_row = meal_schedule.get("dinner")
-            if dinner_row is not None:
-                dinner_start = parse_clock(dinner_row["start_time"]) or 0
-                if not (DINNER_START_MINUTES <= dinner_start <= DINNER_START_MAX_MINUTES):
-                    issues.append(
-                        ValidationIssue(
-                            severity="high",
-                            category="meal-window-dinner",
-                            message=f"第 {day.day} 天晚餐开始时间为 {dinner_row['start_time']}，不在 17:00-19:00 窗口内。",
-                            day=day.day,
-                            suggested_fix="减少晚餐前活动或把夜游改到餐后，确保晚餐落在 17:00-19:00 之间。",
-                        )
-                    )
-
-            arrival_minutes = segment_arrival_minutes(day.arrival_segment)
-            if arrival_minutes is not None:
-                earliest_play_minutes = arrival_minutes + INTERCITY_ARRIVAL_BUFFER_MINUTES
-                first_spot_row = next((row for row in scheduled if row["kind"] == "spot"), None)
-                if first_spot_row is not None:
-                    first_spot_start = parse_clock(first_spot_row["start_time"]) or 0
-                    if first_spot_start < earliest_play_minutes:
-                        issues.append(
-                            ValidationIssue(
-                                severity="high",
-                                category="arrival-buffer-conflict",
-                                message=f"第 {day.day} 天首个景点开始于 {first_spot_row['start_time']}，早于入城缓冲后的可执行时间。",
-                                day=day.day,
-                                suggested_fix="顺延首日活动，必要时先午餐再开始下午行程。",
-                            )
-                        )
-                if arrival_minutes >= 11 * 60 and day.spots:
-                    first_spot = day.spots[0]
-                    if str(first_spot.best_time).lower() == "morning":
-                        issues.append(
-                            ValidationIssue(
-                                severity="medium",
-                                category="arrival-morning-spot",
-                                message=f"第 {day.day} 天到达时间较晚，但首个景点 {first_spot.name} 仍偏上午型。",
-                                day=day.day,
-                                suggested_fix="把首日下午优先替换为更适合下午/傍晚的景点。",
-                            )
-                        )
-
-            departure_minutes = segment_departure_minutes(day.departure_segment)
-            if departure_minutes is not None and scheduled:
-                latest_finish = departure_minutes - INTERCITY_DEPARTURE_BUFFER_MINUTES
-                last_row = scheduled[-1]
-                last_end = parse_clock(last_row["end_time"]) or 0
-                if last_end > latest_finish:
-                    issues.append(
-                        ValidationIssue(
-                            severity="high",
-                            category="departure-buffer-conflict",
-                            message=f"第 {day.day} 天最后活动结束于 {last_row['end_time']}，已挤占返程缓冲。",
-                            day=day.day,
-                            suggested_fix="压缩末日活动数量，确保返程前至少保留 90 分钟缓冲。",
-                        )
-                    )
+                )
 
             for spot in day.spots:
+                if self._spot_has_avoid_tag(spot, avoid_tags):
+                    issues.append(
+                        ValidationIssue(
+                            severity="high",
+                            category="avoid-tag-violation",
+                            message=f"景点 {spot.name} 命中规避标签：{'、'.join(constraints.avoid_tags)}。",
+                            day=day.day,
+                            suggested_fix="替换为不含规避标签的候选景点。",
+                        )
+                    )
+
                 poi_key = self._poi_key(spot)
                 if poi_key in seen_pois:
                     issues.append(
@@ -358,18 +287,6 @@ class ConstraintValidatorAgent:
                             suggested_fix="重新检索真实景点候选。",
                         )
                     )
-
-            must_have_hits = sum(1 for spot in day.spots if set(spot.tags).intersection(constraints.must_have_tags))
-            if constraints.must_have_tags and must_have_hits == 0:
-                issues.append(
-                    ValidationIssue(
-                        severity="low",
-                        category="interest-match",
-                        message=f"第 {day.day} 天对用户核心兴趣覆盖不足。",
-                        day=day.day,
-                        suggested_fix="替换成更符合用户兴趣标签的景点。",
-                    )
-                )
 
         if meal_prices and len({round(price, 1) for price in meal_prices}) <= 2:
             issues.append(
@@ -399,6 +316,57 @@ class ConstraintValidatorAgent:
                 score -= 4
         return max(0.0, score)
 
+    def _required_names(self, constraints: TravelConstraints) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for value in constraints.must_include_spots:
+            normalized = value.strip()
+            if not normalized:
+                continue
+            key = self._normalize_text(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(normalized)
+        for values in constraints.must_include_spots_by_day.values():
+            for value in values:
+                normalized = value.strip()
+                if not normalized:
+                    continue
+                key = self._normalize_text(normalized)
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(normalized)
+        return names
+
+    def _is_required_match(self, current_name: str, required_name: str) -> bool:
+        current_norm = self._normalize_text(current_name)
+        required_norm = self._normalize_text(required_name)
+        if not current_norm or not required_norm:
+            return False
+        return (
+            current_norm == required_norm
+            or required_norm in current_norm
+            or current_norm in required_norm
+        )
+
+    def _spot_has_avoid_tag(self, spot, avoid_tags: list[str]) -> bool:
+        if not avoid_tags:
+            return False
+        tags = {tag.strip().lower() for tag in getattr(spot, "tags", []) if str(tag).strip()}
+        if tags.intersection(avoid_tags):
+            return True
+        text = f"{spot.name} {spot.category} {spot.description}".lower()
+        return any(tag and tag in text for tag in avoid_tags)
+
+    def _hotel_matches_area(self, hotel, area: str) -> bool:
+        area_text = area.strip().lower()
+        if not area_text:
+            return True
+        text = f"{hotel.name} {hotel.district} {hotel.address}".lower()
+        return area_text in text
+
     def _meal_key(self, meal) -> str:
         snippet = ""
         if meal.source_evidence:
@@ -409,3 +377,6 @@ class ConstraintValidatorAgent:
     def _poi_key(self, spot) -> str:
         address = (spot.address or spot.description or spot.district or "").strip().lower()
         return f"{spot.name.strip().lower()}|{address}"
+
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"[\s·・,，。；:：\\-_/()（）]+", "", value.strip().lower())

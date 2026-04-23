@@ -93,7 +93,24 @@ class FoodSpotAgent:
             for food in candidates
         ]
         if not candidates_with_distance:
-            raise RuntimeError(f"{meal_type} 餐次缺少可用餐饮候选，无法生成可靠方案。")
+            fallback_food = self._build_fallback_food(meal_type, day_index)
+            estimated_cost = self._cost_for_meal(fallback_food, meal_type, day_index)
+            meal = MealRecommendation(
+                venue_name=fallback_food.name,
+                meal_type=meal_type,  # type: ignore[arg-type]
+                estimated_cost=estimated_cost,
+                reason=f"{meal_type} 候选不足，已按降级策略补齐餐饮占位。",
+                venue_district=fallback_food.district,
+                cuisine=fallback_food.cuisine,
+                lat=fallback_food.lat,
+                lon=fallback_food.lon,
+                anchor_distance_km=0.0,
+                route_distance_km=0.0,
+                fallback_used=True,
+                selection_tier="fallback",
+                source_evidence=fallback_food.source_evidence[:1],
+            )
+            return meal, self._food_key(fallback_food)
         distance_ladders = self._distance_ladders(meal_type)
         selection_pool: list[tuple[FoodVenue, float, float]] = []
         selection_tier = "strict"
@@ -411,3 +428,19 @@ class FoodSpotAgent:
             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
         )
         return 2 * radius * math.asin(math.sqrt(a))
+
+    def _build_fallback_food(self, meal_type: str, day_index: int) -> FoodVenue:
+        meal_label = "午餐" if meal_type == "lunch" else "晚餐"
+        return FoodVenue(
+            name=f"当日{meal_label}推荐{day_index}",
+            district="市中心",
+            cuisine="本地风味",
+            description=f"{meal_label}在线候选不足后的降级补齐项",
+            average_cost=55.0 if meal_type == "lunch" else 88.0,
+            tags=["food", "fallback"],
+            taste_profile=[],
+            meal_suitability=meal_type if meal_type in {"lunch", "dinner"} else "both",  # type: ignore[arg-type]
+            lat=0.0,
+            lon=0.0,
+            source_evidence=[],
+        )

@@ -41,6 +41,8 @@ class TravelConstraints:
     preferred_areas: list[str] = field(default_factory=list)
     must_have_tags: list[str] = field(default_factory=list)
     avoid_tags: list[str] = field(default_factory=list)
+    must_include_spots: list[str] = field(default_factory=list)
+    must_include_spots_by_day: dict[int, list[str]] = field(default_factory=dict)
     pacing_note: str = ""
 
 

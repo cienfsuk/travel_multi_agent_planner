@@ -1,6 +1,8 @@
 import type {
   CaseSummary,
   PlanResponse,
+  RoutePlanRequest,
+  RoutePlanResponse,
   SSEEvent,
   SystemStatus,
   TripRequest,
@@ -35,6 +37,26 @@ export async function fetchLatestCase(): Promise<PlanResponse> {
 export async function fetchCase(caseId: string): Promise<PlanResponse> {
   const res = await fetch(`${BASE}/cases/${caseId}`);
   if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchRoutePlan(
+  request: RoutePlanRequest,
+): Promise<RoutePlanResponse> {
+  const res = await fetch(`${BASE}/route/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!res.ok) {
+    const raw = await res.text();
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string };
+      throw new Error(parsed.detail || raw);
+    } catch {
+      throw new Error(raw);
+    }
+  }
   return res.json();
 }
 

@@ -6,12 +6,15 @@ import type {
   AnimationStep,
   SourceEvidence,
   PlanResponse,
+  RoutePlanLeg,
+  RoutePlanResponse,
+  RouteTransportMode,
   TransportSegment,
 } from "../types/api";
+import { fetchRoutePlan } from "../api/client";
 import {
   translateNoteStyle,
   translateEvidenceType,
-  translateTags,
 } from "../utils/translations";
 import TripMapView, { type TripMapHandle } from "./TripMapView";
 
@@ -72,6 +75,36 @@ function summarizeStepTransport(step: AnimationStep) {
   return `${step.next_transport_type} · ${detailParts.join(" · ")}`;
 }
 
+function transportModeLabel(mode: RouteTransportMode): string {
+  const labels: Record<RouteTransportMode, string> = {
+    driving: "自驾/观光车",
+    walking: "步行",
+    bicycling: "骑行",
+    transit: "公共交通",
+  };
+  return labels[mode];
+}
+
+function computeLegPlaybackMs(
+  leg: RoutePlanLeg | null,
+  speed: "slow" | "normal" | "fast",
+): number {
+  const rangeBySpeed = {
+    slow: { min: 3200, max: 32000, factor: 1.35 },
+    normal: { min: 2200, max: 22000, factor: 1 },
+    fast: { min: 1400, max: 15000, factor: 0.72 },
+  }[speed];
+  if (!leg) {
+    return rangeBySpeed.min;
+  }
+  const distanceBased = Math.max(0.2, leg.distance_km || 0) * 4200;
+  const durationBased = Math.max(1, leg.duration_minutes || 0) * 1000;
+  const mixed = (distanceBased * 0.6 + durationBased * 0.4) * rangeBySpeed.factor;
+  return Math.round(
+    Math.max(rangeBySpeed.min, Math.min(rangeBySpeed.max, mixed)),
+  );
+}
+
 function flattenEvidence(plan: PlanResponse["plan"]): EvidenceRow[] {
   const rows: EvidenceRow[] = [];
   const pushEvidence = (
@@ -106,6 +139,28 @@ function flattenEvidence(plan: PlanResponse["plan"]): EvidenceRow[] {
     }
   }
   return rows;
+}
+
+function normalizeMatchText(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s·・,，。；:：\-_/()（）]+/g, "");
+}
+
+function isPreferenceStatusNote(value: string): boolean {
+  const normalized = normalizeMatchText(value);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes("必达景点") ||
+    normalized.includes("偏好景点") ||
+    normalized.includes("已补充必达景点") ||
+    normalized.includes("仍有必达景点未命中") ||
+    normalized.startsWith("仍未命中") ||
+    normalized.startsWith("已命中")
+  );
 }
 
 const MAP_DAY_COLORS = [
@@ -144,9 +199,16 @@ export default function ResultView({ result }: Props) {
   const [mapDay, setMapDay] = useState<number | null>(null);
   const [mapStepIndex, setMapStepIndex] = useState(0);
   const [isMapPlaying, setIsMapPlaying] = useState(false);
+  const [hasMapPlaybackStarted, setHasMapPlaybackStarted] = useState(false);
+  const [mapSegmentProgress, setMapSegmentProgress] = useState(0);
+  const [mapTransportMode, setMapTransportMode] =
+    useState<RouteTransportMode>("driving");
   const [mapPlaySpeed, setMapPlaySpeed] = useState<"slow" | "normal" | "fast">(
     "normal",
   );
+  const [routePlan, setRoutePlan] = useState<RoutePlanResponse | null>(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const mapRef = useRef<TripMapHandle>(null);
 
   const { plan, animation } = result;
@@ -157,8 +219,133 @@ export default function ResultView({ result }: Props) {
       ? animation.steps.filter((s) => s.day === mapDay)
       : animation.steps;
   }, [animation, mapDay]);
+  const stepNodeLookup = useMemo(() => {
+    const lookup = new Map<string, { lat: number; lon: number; title: string }>();
+    for (const node of animation?.nodes ?? []) {
+      lookup.set(`${node.day}-${node.step_index}`, node);
+    }
+    return lookup;
+  }, [animation?.nodes]);
+  const routeInputPoints = useMemo(() => {
+    return filteredAnimSteps
+      .map((step) => stepNodeLookup.get(`${step.day}-${step.step_index}`))
+      .map((node) =>
+        node
+          ? {
+              lat: node.lat,
+              lon: node.lon,
+              label: node.title,
+            }
+          : null,
+      )
+      .filter(
+        (node): node is { lat: number; lon: number; label: string } =>
+          node !== null,
+      );
+  }, [filteredAnimSteps, stepNodeLookup]);
+  const routeInputSignature = useMemo(
+    () =>
+      routeInputPoints
+        .map((point) => `${point.lat.toFixed(6)},${point.lon.toFixed(6)}`)
+        .join("|"),
+    [routeInputPoints],
+  );
+  const currentRouteLeg = useMemo(() => {
+    if (!routePlan?.legs?.length) {
+      return null;
+    }
+    if (mapStepIndex < 0 || mapStepIndex >= routePlan.legs.length) {
+      return null;
+    }
+    return routePlan.legs[mapStepIndex];
+  }, [routePlan, mapStepIndex]);
+  const currentSegmentPlaybackMs = useMemo(
+    () => computeLegPlaybackMs(currentRouteLeg, mapPlaySpeed),
+    [currentRouteLeg, mapPlaySpeed],
+  );
+  const routeWarningsText = useMemo(() => {
+    if (!routePlan?.warnings?.length) {
+      return "";
+    }
+    return routePlan.warnings.slice(0, 2).join("; ");
+  }, [routePlan?.warnings]);
+  const routeModeDisplay = useMemo(
+    () => transportModeLabel(mapTransportMode),
+    [mapTransportMode],
+  );
+  const stepTransportSummary = useMemo(() => {
+    return filteredAnimSteps.map((step, idx) => {
+      const leg = routePlan?.legs?.[idx];
+      if (leg && Array.isArray(leg.path) && leg.path.length >= 2) {
+        const duration = Math.max(0, Number(leg.duration_minutes || 0));
+        const distance = Math.max(0, Number(leg.distance_km || 0));
+        const summary = `${routeModeDisplay} · ${duration} min · ${distance.toFixed(1)} km`;
+        const detail = leg.warning?.trim()
+          ? leg.warning.trim()
+          : leg.status && leg.status !== "ok"
+            ? `Route status: ${leg.status}`
+            : "";
+        return {
+          summary,
+          detail,
+        };
+      }
+      return {
+        summary: summarizeStepTransport(step),
+        detail: step.next_transport_desc || "",
+      };
+    });
+  }, [filteredAnimSteps, routePlan?.legs, routeModeDisplay]);
 
   const currentAnimStep = filteredAnimSteps[mapStepIndex] || null;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (routeInputPoints.length < 2) {
+      setRoutePlan(null);
+      setRouteError(null);
+      setRouteLoading(false);
+      return;
+    }
+
+    setRouteLoading(true);
+    setRouteError(null);
+    fetchRoutePlan({
+      mode: mapTransportMode,
+      points: routeInputPoints,
+      prefer_waypoints: true,
+    })
+      .then((response) => {
+        if (cancelled) {
+          return;
+        }
+        setRoutePlan(response);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        setRoutePlan(null);
+        setRouteError(err instanceof Error ? err.message : "路线规划失败");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRouteLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mapTransportMode, routeInputSignature, routeInputPoints]);
+
+  useEffect(() => {
+    const maxIndex = Math.max(0, filteredAnimSteps.length - 1);
+    if (mapStepIndex > maxIndex) {
+      setMapStepIndex(maxIndex);
+    }
+  }, [filteredAnimSteps.length, mapStepIndex]);
 
   // Prevent background content from scrolling/bleeding through when risk modal is open.
   useEffect(() => {
@@ -173,31 +360,58 @@ export default function ResultView({ result }: Props) {
     };
   }, [showRiskModal]);
 
-  // Reset step index when day filter changes
+  // Reset playback when day filter or transport mode changes
   useEffect(() => {
     setMapStepIndex(0);
     setIsMapPlaying(false);
-  }, [mapDay]);
+    setHasMapPlaybackStarted(false);
+    setMapSegmentProgress(0);
+  }, [mapDay, mapTransportMode]);
 
   // Playback timer
   useEffect(() => {
     if (!isMapPlaying || !filteredAnimSteps.length) return;
-    const speedMs = { slow: 2200, normal: 1400, fast: 860 }[mapPlaySpeed];
-    const timer = setInterval(() => {
-      setMapStepIndex((i) => {
-        if (i >= filteredAnimSteps.length - 1) {
-          setIsMapPlaying(false);
-          return i;
+    if (filteredAnimSteps.length <= 1) {
+      setIsMapPlaying(false);
+      return;
+    }
+    const tickMs = 33;
+    const delta = tickMs / currentSegmentPlaybackMs;
+    const timer = window.setInterval(() => {
+      setMapSegmentProgress((progress) => {
+        const nextProgress = Math.min(1, progress + delta);
+        if (nextProgress < 1) {
+          return nextProgress;
         }
-        return i + 1;
+        setMapStepIndex((i) => {
+          const lastIndex = filteredAnimSteps.length - 1;
+          const nextIndex = Math.min(i + 1, lastIndex);
+          if (nextIndex >= lastIndex) {
+            setIsMapPlaying(false);
+          }
+          return nextIndex;
+        });
+        return 0;
       });
-    }, speedMs);
-    return () => clearInterval(timer);
-  }, [isMapPlaying, mapPlaySpeed, filteredAnimSteps.length]);
+    }, tickMs);
+    return () => window.clearInterval(timer);
+  }, [
+    isMapPlaying,
+    currentSegmentPlaybackMs,
+    mapStepIndex,
+    filteredAnimSteps.length,
+  ]);
+
+  useEffect(() => {
+    if (!isMapPlaying) {
+      return;
+    }
+    setMapSegmentProgress(0);
+  }, [mapStepIndex, isMapPlaying]);
 
   // Fly to step node when step changes
   useEffect(() => {
-    if (!animation || !mapRef.current) return;
+    if (!animation || !mapRef.current || isMapPlaying) return;
     const steps =
       mapDay != null
         ? animation.steps.filter((s) => s.day === mapDay)
@@ -210,24 +424,43 @@ export default function ResultView({ result }: Props) {
     if (node) {
       mapRef.current.flyTo(node.lat, node.lon, node.day, node.step_index);
     }
-  }, [mapStepIndex, mapDay, animation]);
+  }, [mapStepIndex, mapDay, animation, isMapPlaying]);
 
   const handleMapPrevStep = () => {
     setMapStepIndex((i) => Math.max(0, i - 1));
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
   const handleMapNextStep = () => {
     setMapStepIndex((i) => Math.min(filteredAnimSteps.length - 1, i + 1));
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
-  const handleMapPlayPause = () => setIsMapPlaying((v) => !v);
+  const handleMapPlayPause = () => {
+    if (!filteredAnimSteps.length) {
+      return;
+    }
+    if (isMapPlaying) {
+      setIsMapPlaying(false);
+      return;
+    }
+    if (mapStepIndex >= filteredAnimSteps.length - 1) {
+      setMapStepIndex(0);
+      setMapSegmentProgress(0);
+    }
+    setHasMapPlaybackStarted(true);
+    setIsMapPlaying(true);
+  };
   const handleMapReset = () => {
     setMapStepIndex(0);
     setIsMapPlaying(false);
+    setHasMapPlaybackStarted(false);
+    setMapSegmentProgress(0);
   };
   const handleJumpToStep = (idx: number) => {
     setMapStepIndex(idx);
     setIsMapPlaying(false);
+    setMapSegmentProgress(0);
   };
 
   useEffect(() => {
@@ -264,6 +497,63 @@ export default function ResultView({ result }: Props) {
     ];
   }, [plan.validation_issues, plan.warnings]);
   const riskCount = riskItems.length;
+  const mustHitStatus = useMemo(() => {
+    const required = [
+      ...(plan.constraints?.must_include_spots ?? []),
+      ...Object.values(plan.constraints?.must_include_spots_by_day ?? {}).flat(),
+    ];
+    const dedupedRequired = Array.from(
+      new Map(
+        required
+          .map((name) => name.trim())
+          .filter(Boolean)
+          .map((name) => [normalizeMatchText(name), name]),
+      ).values(),
+    );
+    if (!dedupedRequired.length) {
+      return null;
+    }
+    const spotNames = plan.days.flatMap((day) => day.spots.map((spot) => spot.name));
+    const hits: string[] = [];
+    const missing: string[] = [];
+    for (const requiredName of dedupedRequired) {
+      const requiredNorm = normalizeMatchText(requiredName);
+      const matched = spotNames.find((spotName) => {
+        const spotNorm = normalizeMatchText(spotName);
+        return (
+          spotNorm === requiredNorm ||
+          spotNorm.includes(requiredNorm) ||
+          requiredNorm.includes(spotNorm)
+        );
+      });
+      if (matched) {
+        hits.push(matched);
+      } else {
+        missing.push(requiredName);
+      }
+    }
+    return {
+      hits: Array.from(new Set(hits)),
+      missing,
+    };
+  }, [plan.constraints, plan.days]);
+  const filteredSearchNotes = useMemo(() => {
+    const deduped = new Set<string>();
+    const notes: string[] = [];
+    for (const raw of plan.search_notes ?? []) {
+      const note = raw?.trim();
+      if (!note || isPreferenceStatusNote(note)) {
+        continue;
+      }
+      const key = normalizeMatchText(note);
+      if (!key || deduped.has(key)) {
+        continue;
+      }
+      deduped.add(key);
+      notes.push(note);
+    }
+    return notes.slice(0, 5);
+  }, [plan.search_notes]);
 
   useEffect(() => {
     setEvidencePage(1);
@@ -400,9 +690,25 @@ export default function ResultView({ result }: Props) {
                         </span>
                       )}
                     </div>
-                    {!!plan.search_notes?.length && (
+                    {(mustHitStatus || filteredSearchNotes.length > 0) && (
                       <div className="rounded-xl bg-slate-50 p-3 text-xs dark:bg-slate-900/40">
-                        {plan.search_notes.slice(0, 3).map((note, idx) => (
+                        {mustHitStatus && (
+                          <div className="space-y-1 pb-1">
+                            <div>
+                              - 偏好景点已命中：
+                              {mustHitStatus.hits.length
+                                ? mustHitStatus.hits.join("、")
+                                : "无"}
+                              。
+                            </div>
+                            {mustHitStatus.missing.length > 0 && (
+                              <div className="text-amber-600 dark:text-amber-400">
+                                - 偏好景点未命中：{mustHitStatus.missing.join("、")}。
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {filteredSearchNotes.map((note, idx) => (
                           <div key={idx}>- {note}</div>
                         ))}
                       </div>
@@ -582,7 +888,8 @@ export default function ResultView({ result }: Props) {
                   </button>
                   <button
                     onClick={handleMapPlayPause}
-                    className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${
+                    disabled={routeLoading}
+                    className={`rounded-lg px-3 py-1.5 text-xs font-bold transition disabled:opacity-50 ${
                       isMapPlaying
                         ? "bg-amber-500 text-white hover:bg-amber-600"
                         : "bg-indigo-600 text-white hover:bg-indigo-700"
@@ -604,6 +911,18 @@ export default function ResultView({ result }: Props) {
                     重置
                   </button>
                   <select
+                    value={mapTransportMode}
+                    onChange={(e) =>
+                      setMapTransportMode(e.target.value as RouteTransportMode)
+                    }
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200"
+                  >
+                    <option value="driving">自驾/观光车</option>
+                    <option value="walking">步行</option>
+                    <option value="bicycling">骑行</option>
+                    <option value="transit">公共交通</option>
+                  </select>
+                  <select
                     value={mapPlaySpeed}
                     onChange={(e) =>
                       setMapPlaySpeed(
@@ -622,6 +941,17 @@ export default function ResultView({ result }: Props) {
                       : "0 / 0"}
                   </span>
                 </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {routeLoading
+                    ? "路线规划中..."
+                    : routeError
+                      ? `路线规划失败：${routeError}`
+                      : routePlan
+                        ? `导航模式：${routeModeDisplay} · 状态：${routePlan.status}${
+                            routeWarningsText ? ` · ${routeWarningsText}` : ""
+                          }`
+                        : "未返回可用导航路线，将使用已有路径信息。"}
+                </div>
               </div>
 
               {/* Main content: map + side panel */}
@@ -632,6 +962,12 @@ export default function ResultView({ result }: Props) {
                     ref={mapRef}
                     animation={animation}
                     selectedDay={mapDay}
+                    showRoutes={hasMapPlaybackStarted}
+                    stepProgress={hasMapPlaybackStarted ? mapSegmentProgress : 0}
+                    routeLegs={routePlan?.legs ?? null}
+                    activeLegIndex={mapStepIndex}
+                    isPlaying={isMapPlaying}
+                    activeLegDurationMs={currentSegmentPlaybackMs}
                     activeStepKey={
                       currentAnimStep
                         ? {
@@ -726,14 +1062,14 @@ export default function ResultView({ result }: Props) {
                             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                               下一段交通
                             </div>
-                            {summarizeStepTransport(step) ? (
+                            {stepTransportSummary[idx]?.summary ? (
                               <>
                                 <div className="mt-1 text-xs font-medium text-slate-700 dark:text-slate-200">
-                                  {summarizeStepTransport(step)}
+                                  {stepTransportSummary[idx]?.summary}
                                 </div>
-                                {step.next_transport_desc && (
+                                {stepTransportSummary[idx]?.detail && (
                                   <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                                    {step.next_transport_desc}
+                                    {stepTransportSummary[idx]?.detail}
                                   </div>
                                 )}
                               </>

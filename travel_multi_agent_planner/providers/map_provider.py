@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import requests
 
@@ -97,12 +98,13 @@ class TencentMapProvider:
     def reorder_spots(self, hotel: dict, spots: list) -> list:
         if len(spots) <= 1:
             return list(spots)
-        if len(spots) <= 3:
-            return self._improve_spot_order(hotel, list(spots))
         spot_nodes = [{"lat": spot.lat, "lon": spot.lon} for spot in spots]
-        order = self.waypoint_order(hotel, spot_nodes)
+        if len(spots) <= 3:
+            order = self._matrix_order(hotel, spot_nodes)
+        else:
+            order = self.waypoint_order(hotel, spot_nodes)
         ordered = [spots[index] for index in order if 0 <= index < len(spots)]
-        return self._improve_spot_order(hotel, ordered)
+        return ordered or list(spots)
 
     def route_walking(self, current: dict, nxt: dict) -> tuple[list[list[float]], int, float]:
         return self._request_route("walking", current, nxt)
@@ -112,6 +114,33 @@ class TencentMapProvider:
 
     def route_transit(self, current: dict, nxt: dict) -> tuple[list[list[float]], int, float]:
         return self._request_route("transit", current, nxt)
+
+    def plan_ordered_route(
+        self,
+        points: list[dict],
+        mode: str = "driving",
+        prefer_waypoints: bool = True,
+    ) -> dict:
+        self._ensure_key()
+        normalized_points = self._normalize_route_points(points)
+        if len(normalized_points) < 2:
+            raise ValueError("At least two points are required to plan a route.")
+
+        resolved_mode = self._normalize_route_mode(mode)
+        warnings: list[str] = []
+
+        if resolved_mode == "driving" and prefer_waypoints and len(normalized_points) <= 32:
+            try:
+                return self._request_driving_route_with_waypoints(normalized_points)
+            except Exception as exc:
+                warnings.append(f"waypoints planning failed, fallback to per-leg planning: {exc}")
+
+        result = self._request_route_by_legs(normalized_points, resolved_mode)
+        if warnings:
+            result["warnings"] = warnings + result.get("warnings", [])
+            if result.get("status") == "ok":
+                result["status"] = "partial"
+        return result
 
     def _request_best_route(self, current: dict, nxt: dict, preferred_mode: str) -> tuple[list[list[float]], int, float, str, str]:
         mode_sequence = self._mode_sequence(preferred_mode)
@@ -143,11 +172,16 @@ class TencentMapProvider:
         )
         result = payload.get("result") or {}
         route = (result.get("routes") or [{}])[0]
-        polyline = route.get("polyline") or self._extract_transit_polyline(route)
-        path = self._decode_polyline(polyline)
-        distance_km = round(float(route.get("distance", 0.0)) / 1000, 2)
-        raw_duration_seconds = float(route.get("duration", 0.0) or 0.0)
-        duration = round(raw_duration_seconds / 60) if raw_duration_seconds > 0 else 0
+        if mode == "transit":
+            path = self._extract_transit_path(route)
+        else:
+            polyline = route.get("polyline") or []
+            path = self._decode_polyline(polyline)
+        safe_path = self._sanitize_path(path)
+        if safe_path:
+            path = safe_path
+        distance_km = self._extract_route_distance_km(route, path)
+        duration = self._extract_route_duration_minutes(route, distance_km, mode)
         if not path:
             raise RuntimeError("腾讯路径规划未返回有效路线，无法生成可靠方案。")
         return path, duration, distance_km
@@ -155,9 +189,366 @@ class TencentMapProvider:
     def _endpoint_for_mode(self, mode: str) -> str:
         if mode == "walking":
             return "https://apis.map.qq.com/ws/direction/v1/walking/"
+        if mode == "bicycling":
+            return "https://apis.map.qq.com/ws/direction/v1/bicycling/"
         if mode == "transit":
             return "https://apis.map.qq.com/ws/direction/v1/transit/"
         return "https://apis.map.qq.com/ws/direction/v1/driving/"
+
+    def _request_driving_route_with_waypoints(self, points: list[dict]) -> dict:
+        if len(points) < 2:
+            raise ValueError("At least two points are required.")
+        if len(points) > 32:
+            raise ValueError("Driving waypoints mode supports at most 32 ordered points.")
+
+        params = {
+            "from": f"{points[0]['lat']},{points[0]['lon']}",
+            "to": f"{points[-1]['lat']},{points[-1]['lon']}",
+            "key": self.api_key,
+        }
+        if len(points) > 2:
+            params["waypoints"] = ";".join(f"{point['lat']},{point['lon']}" for point in points[1:-1])
+
+        payload = self._get(
+            "https://apis.map.qq.com/ws/direction/v1/driving/",
+            params,
+        )
+        route = ((payload.get("result") or {}).get("routes") or [{}])[0]
+        decoded_path = self._sanitize_path(self._decode_polyline(route.get("polyline") or []))
+        if len(decoded_path) < 2:
+            raise RuntimeError("Driving route did not return a valid polyline.")
+
+        total_distance_km = self._extract_route_distance_km(route, decoded_path)
+        total_duration_minutes = self._extract_route_duration_minutes(route, total_distance_km, "driving")
+        legs = self._split_polyline_into_legs(decoded_path, points, total_duration_minutes)
+
+        return {
+            "requested_mode": "driving",
+            "mode": "driving",
+            "status": "ok",
+            "distance_km": round(sum(float(leg.get("distance_km", 0.0)) for leg in legs), 3),
+            "duration_minutes": int(sum(int(leg.get("duration_minutes", 0)) for leg in legs)),
+            "path": decoded_path,
+            "legs": legs,
+            "warnings": [],
+        }
+
+    def _request_route_by_legs(self, points: list[dict], mode: str) -> dict:
+        merged_path: list[list[float]] = []
+        legs: list[dict] = []
+        warnings: list[str] = []
+        has_fallback = False
+
+        for from_index in range(len(points) - 1):
+            to_index = from_index + 1
+            current = points[from_index]
+            nxt = points[to_index]
+            leg_status = "ok"
+            warning = ""
+            try:
+                path, duration_minutes, distance_km = self._request_route(mode, current, nxt)
+                safe_path = self._sanitize_path(path)
+            except Exception as exc:
+                has_fallback = True
+                warning = f"leg {from_index + 1} failed ({exc}), fallback to straight segment."
+                warnings.append(warning)
+                safe_path = [
+                    [float(current["lon"]), float(current["lat"])],
+                    [float(nxt["lon"]), float(nxt["lat"])],
+                ]
+                distance_km = round(self._haversine(current["lat"], current["lon"], nxt["lat"], nxt["lon"]), 3)
+                duration_minutes = max(0, round(distance_km / self._mode_speed_kmh(mode) * 60))
+                leg_status = "fallback"
+            if duration_minutes <= 0 and distance_km > 0:
+                duration_minutes = max(1, round(distance_km / self._mode_speed_kmh(mode) * 60))
+
+            if len(safe_path) < 2:
+                safe_path = [
+                    [float(current["lon"]), float(current["lat"])],
+                    [float(nxt["lon"]), float(nxt["lat"])],
+                ]
+
+            if not merged_path:
+                merged_path.extend(safe_path)
+            else:
+                merged_path.extend(safe_path[1:] if safe_path[0] == merged_path[-1] else safe_path)
+
+            legs.append(
+                {
+                    "from_index": from_index,
+                    "to_index": to_index,
+                    "status": leg_status,
+                    "distance_km": round(float(distance_km), 3),
+                    "duration_minutes": int(max(0, duration_minutes)),
+                    "path": safe_path,
+                    "warning": warning,
+                }
+            )
+
+        return {
+            "requested_mode": mode,
+            "mode": mode,
+            "status": "partial" if has_fallback else "ok",
+            "distance_km": round(sum(float(leg["distance_km"]) for leg in legs), 3),
+            "duration_minutes": int(sum(int(leg["duration_minutes"]) for leg in legs)),
+            "path": merged_path,
+            "legs": legs,
+            "warnings": warnings,
+        }
+
+    def _normalize_route_points(self, points: list[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for index, point in enumerate(points):
+            try:
+                lat = float(point.get("lat"))
+                lon = float(point.get("lon"))
+            except Exception as exc:
+                raise ValueError(f"Invalid route point #{index + 1}: {exc}") from exc
+            if not self._is_valid_lon_lat(lon, lat):
+                raise ValueError(f"Route point #{index + 1} out of range: lat={lat}, lon={lon}")
+            normalized.append(
+                {
+                    "lat": lat,
+                    "lon": lon,
+                    "label": str(point.get("label", "")),
+                }
+            )
+        return normalized
+
+    def _normalize_route_mode(self, mode: str) -> str:
+        value = (mode or "").strip().lower()
+        if value in {"walking", "walk"}:
+            return "walking"
+        if value in {"driving", "drive", "car", "taxi"}:
+            return "driving"
+        if value in {"bicycling", "bike", "cycling", "ebicycling"}:
+            return "bicycling"
+        if value in {"transit", "bus", "metro", "public_transport"}:
+            return "transit"
+        return "driving"
+
+    def _mode_speed_kmh(self, mode: str) -> float:
+        if mode == "walking":
+            return 4.5
+        if mode == "bicycling":
+            return 13.0
+        if mode == "transit":
+            return 22.0
+        return 28.0
+
+    def _split_polyline_into_legs(
+        self,
+        path: list[list[float]],
+        points: list[dict],
+        total_duration_minutes: int,
+    ) -> list[dict]:
+        if len(path) < 2:
+            return []
+        route_indexes: list[int] = [0]
+        cursor = 0
+        for point in points[1:-1]:
+            nearest = self._nearest_path_index(path, point["lon"], point["lat"], cursor)
+            route_indexes.append(nearest)
+            cursor = nearest
+        route_indexes.append(len(path) - 1)
+
+        legs: list[dict] = []
+        total_path_distance = self._path_distance_km(path)
+        consumed_duration = 0
+        total_duration_minutes = max(0, int(round(total_duration_minutes)))
+
+        for from_index in range(len(points) - 1):
+            start_idx = route_indexes[from_index]
+            end_idx = route_indexes[from_index + 1]
+            if end_idx <= start_idx:
+                end_idx = min(len(path) - 1, start_idx + 1)
+            leg_path = path[start_idx : end_idx + 1]
+            if len(leg_path) < 2:
+                leg_path = [
+                    [float(points[from_index]["lon"]), float(points[from_index]["lat"])],
+                    [float(points[from_index + 1]["lon"]), float(points[from_index + 1]["lat"])],
+                ]
+            leg_distance = self._path_distance_km(leg_path)
+            if from_index == len(points) - 2:
+                leg_duration = max(0, total_duration_minutes - consumed_duration)
+            else:
+                ratio = 0.0 if total_path_distance <= 0 else leg_distance / total_path_distance
+                leg_duration = max(0, round(total_duration_minutes * ratio))
+                consumed_duration += leg_duration
+
+            legs.append(
+                {
+                    "from_index": from_index,
+                    "to_index": from_index + 1,
+                    "status": "ok",
+                    "distance_km": round(leg_distance, 3),
+                    "duration_minutes": int(leg_duration),
+                    "path": leg_path,
+                    "warning": "",
+                }
+            )
+        return legs
+
+    def _nearest_path_index(
+        self,
+        path: list[list[float]],
+        lon: float,
+        lat: float,
+        start_index: int,
+    ) -> int:
+        best_index = max(0, min(start_index, len(path) - 1))
+        best_distance = float("inf")
+        for index in range(best_index, len(path)):
+            point_lon = float(path[index][0])
+            point_lat = float(path[index][1])
+            distance = self._haversine(lat, lon, point_lat, point_lon)
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def _path_distance_km(self, path: list[list[float]]) -> float:
+        if len(path) < 2:
+            return 0.0
+        total = 0.0
+        for start, end in zip(path, path[1:]):
+            total += self._haversine(float(start[1]), float(start[0]), float(end[1]), float(end[0]))
+        return round(total, 3)
+
+    def _sanitize_path(self, path: list[list[float]]) -> list[list[float]]:
+        cleaned: list[list[float]] = []
+        for point in path:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            lon = float(point[0])
+            lat = float(point[1])
+            if not self._is_valid_lon_lat(lon, lat):
+                continue
+            if not cleaned or cleaned[-1][0] != lon or cleaned[-1][1] != lat:
+                cleaned.append([lon, lat])
+        return cleaned
+
+    def _is_valid_lon_lat(self, lon: float, lat: float) -> bool:
+        return -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0
+
+    def _extract_route_distance_km(self, route: dict, path: list[list[float]]) -> float:
+        direct_distance = self._parse_numeric(route.get("distance"))
+        if direct_distance > 0:
+            if direct_distance > 50:
+                return round(direct_distance / 1000, 3)
+            return round(direct_distance, 3)
+
+        steps = route.get("steps") or []
+        if isinstance(steps, list):
+            step_distance = 0.0
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                value = self._parse_numeric(step.get("distance"))
+                if value > 0:
+                    step_distance += value
+            if step_distance > 0:
+                if step_distance > 50:
+                    return round(step_distance / 1000, 3)
+                return round(step_distance, 3)
+
+        if path:
+            return round(self._path_distance_km(path), 3)
+        return 0.0
+
+    def _extract_route_duration_minutes(self, route: dict, distance_km: float, mode: str) -> int:
+        direct_candidates = [
+            route.get("duration"),
+            route.get("duration_in_traffic"),
+            route.get("time"),
+            route.get("cost_time"),
+            route.get("estimated_time"),
+        ]
+        for raw in direct_candidates:
+            value = self._parse_numeric(raw)
+            if value <= 0:
+                continue
+            return self._normalize_duration_minutes(value, distance_km, mode)
+
+        steps = route.get("steps") or []
+        if isinstance(steps, list) and steps:
+            step_minutes = 0
+            has_step_duration = False
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                raw_step_duration = self._parse_numeric(
+                    step.get("duration") or step.get("time") or step.get("cost_time")
+                )
+                if raw_step_duration <= 0:
+                    continue
+                step_distance = self._extract_route_distance_km(step, [])
+                step_minutes += self._normalize_duration_minutes(
+                    raw_step_duration,
+                    step_distance,
+                    mode,
+                )
+                has_step_duration = True
+            if has_step_duration:
+                return max(0, int(round(step_minutes)))
+
+        if distance_km > 0:
+            return max(1, round(distance_km / self._mode_speed_kmh(mode) * 60))
+        return 0
+
+    def _normalize_duration_minutes(self, raw_value: float, distance_km: float, mode: str) -> int:
+        if raw_value <= 0:
+            return 0
+        minutes_as_minutes = raw_value
+        minutes_as_seconds = raw_value / 60.0
+
+        if distance_km <= 0.05:
+            if raw_value >= 300:
+                return max(0, int(round(minutes_as_seconds)))
+            return max(0, int(round(minutes_as_minutes)))
+
+        expected_speed = self._mode_speed_kmh(mode)
+        min_speed, max_speed = self._mode_speed_bounds_kmh(mode)
+
+        def score(minutes: float) -> float:
+            minutes = max(minutes, 0.1)
+            speed = distance_km / (minutes / 60.0)
+            penalty = abs(math.log(max(speed, 0.1) / expected_speed))
+            if speed < min_speed or speed > max_speed:
+                penalty += 3.5
+            return penalty
+
+        score_minutes = score(minutes_as_minutes)
+        score_seconds = score(minutes_as_seconds)
+        chosen = minutes_as_seconds if score_seconds < score_minutes else minutes_as_minutes
+        return max(0, int(round(chosen)))
+
+    def _mode_speed_bounds_kmh(self, mode: str) -> tuple[float, float]:
+        if mode == "walking":
+            return (1.0, 8.0)
+        if mode == "bicycling":
+            return (3.0, 40.0)
+        if mode == "transit":
+            return (4.0, 100.0)
+        return (5.0, 140.0)
+
+    def _parse_numeric(self, value: object) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            if math.isfinite(float(value)):
+                return float(value)
+            return 0.0
+        text = str(value).strip()
+        if not text:
+            return 0.0
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return 0.0
+        try:
+            return float(match.group(0))
+        except Exception:
+            return 0.0
 
     def _get(self, url: str, params: dict) -> dict:
         return self._http.get(url, params)
@@ -166,7 +557,11 @@ class TencentMapProvider:
         if not isinstance(polyline, list) or len(polyline) < 2:
             return []
         values = [float(item) for item in polyline]
-        if len(values) > 4:
+        # Tencent polyline stores the first point as absolute coordinates and
+        # all subsequent values as 1e6 deltas against the value two positions before.
+        # This also applies to a 2-point route (len == 4), so decode whenever
+        # there is at least one delta pair.
+        if len(values) > 2:
             for index in range(2, len(values)):
                 values[index] = values[index - 2] + values[index] / 1000000
         points: list[list[float]] = []
@@ -231,17 +626,198 @@ class TencentMapProvider:
             return f"{label_map.get(segment_type, segment_type)}从 {current['label']} 前往 {nxt['label']}，腾讯路径返回约 {duration_minutes} 分钟，路线约 {distance_km:.1f} km。"
         return f"{label_map.get(segment_type, segment_type)}从 {current['label']} 前往 {nxt['label']}，腾讯未返回可靠耗时，按路线距离估算约 {duration_minutes} 分钟 / {distance_km:.1f} km。"
 
-    def _extract_transit_polyline(self, route: dict) -> list:
+    def _extract_transit_path(self, route: dict) -> list[list[float]]:
+        path_parts: list[list[list[float]]] = []
+
+        route_polyline = route.get("polyline") or []
+        route_path = self._decode_and_sanitize_polyline(route_polyline)
+        if len(route_path) >= 2:
+            path_parts.append(route_path)
+
         steps = route.get("steps") or []
-        values: list = []
-        for step in steps:
-            polyline = step.get("polyline") or []
-            if isinstance(polyline, list) and polyline:
-                if not values:
-                    values.extend(polyline)
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                step_path = self._decode_and_sanitize_polyline(step.get("polyline") or [])
+                if len(step_path) >= 2:
+                    path_parts.append(step_path)
+
+                lines = step.get("lines") or []
+                if isinstance(lines, list):
+                    line = self._select_transit_line(lines)
+                    if isinstance(line, dict):
+                        line_path = self._decode_and_sanitize_polyline(line.get("polyline") or [])
+                        line_path = self._trim_transit_line_path(line_path, line)
+                        if len(line_path) >= 2:
+                            path_parts.append(line_path)
+
+        merged = self._merge_transit_path_parts(path_parts)
+        return self._repair_transit_internal_jumps(merged)
+
+    def _decode_and_sanitize_polyline(self, polyline: list) -> list[list[float]]:
+        return self._sanitize_path(self._decode_polyline(polyline))
+
+    def _trim_transit_line_path(self, path: list[list[float]], line: dict) -> list[list[float]]:
+        if len(path) < 2:
+            return path
+
+        geton = self._extract_location_lon_lat(line.get("geton"))
+        getoff = self._extract_location_lon_lat(line.get("getoff"))
+        if not geton or not getoff:
+            return path
+
+        start_idx = self._nearest_path_vertex(path, geton[0], geton[1])
+        end_idx = self._nearest_path_vertex(path, getoff[0], getoff[1])
+        if start_idx == end_idx:
+            return path
+        if start_idx < end_idx:
+            candidate = path[start_idx : end_idx + 1]
+        else:
+            candidate = list(reversed(path[end_idx : start_idx + 1]))
+        return candidate if len(candidate) >= 2 else path
+
+    def _extract_location_lon_lat(self, node: object) -> tuple[float, float] | None:
+        if not isinstance(node, dict):
+            return None
+        location = node.get("location")
+        if not isinstance(location, dict):
+            return None
+        lat = self._parse_numeric(location.get("lat"))
+        lon = self._parse_numeric(location.get("lng") or location.get("lon"))
+        if lat == 0 and lon == 0:
+            return None
+        if not self._is_valid_lon_lat(lon, lat):
+            return None
+        return (lon, lat)
+
+    def _nearest_path_vertex(self, path: list[list[float]], lon: float, lat: float) -> int:
+        best_index = 0
+        best_distance = float("inf")
+        for index, point in enumerate(path):
+            if len(point) < 2:
+                continue
+            distance = self._haversine(lat, lon, float(point[1]), float(point[0]))
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def _select_transit_line(self, lines: list) -> dict | None:
+        candidates = [line for line in lines if isinstance(line, dict)]
+        if not candidates:
+            return None
+        best = candidates[0]
+        best_score = float("inf")
+        for line in candidates:
+            distance_km = self._extract_route_distance_km(line, [])
+            duration_minutes = self._extract_route_duration_minutes(line, distance_km, "transit")
+            if duration_minutes <= 0:
+                duration_minutes = 999999
+            if duration_minutes < best_score:
+                best = line
+                best_score = duration_minutes
+        return best
+
+    def _merge_transit_path_parts(self, path_parts: list[list[list[float]]]) -> list[list[float]]:
+        merged: list[list[float]] = []
+        for part in path_parts:
+            if len(part) < 2:
+                continue
+            if not merged:
+                merged.extend(part)
+                continue
+
+            gap_km = self._haversine(
+                float(merged[-1][1]),
+                float(merged[-1][0]),
+                float(part[0][1]),
+                float(part[0][0]),
+            )
+            if gap_km > 0.35:
+                bridge = self._build_gap_bridge(merged[-1], part[0])
+                if bridge:
+                    if bridge[0] == merged[-1]:
+                        merged.extend(bridge[1:])
+                    else:
+                        merged.extend(bridge)
+
+            if merged and merged[-1] == part[0]:
+                merged.extend(part[1:])
+            else:
+                merged.extend(part)
+
+        return self._sanitize_path(merged)
+
+    def _build_gap_bridge(self, from_point: list[float], to_point: list[float]) -> list[list[float]]:
+        if len(from_point) < 2 or len(to_point) < 2:
+            return []
+        gap_km = self._haversine(
+            float(from_point[1]),
+            float(from_point[0]),
+            float(to_point[1]),
+            float(to_point[0]),
+        )
+        if gap_km <= 0.35 or gap_km > 8:
+            return []
+        try:
+            bridge_path, _, _ = self._request_route(
+                "walking",
+                {"lat": float(from_point[1]), "lon": float(from_point[0])},
+                {"lat": float(to_point[1]), "lon": float(to_point[0])},
+            )
+            safe_bridge = self._sanitize_path(bridge_path)
+            return safe_bridge if len(safe_bridge) >= 2 else []
+        except Exception:
+            return []
+
+    def _repair_transit_internal_jumps(self, path: list[list[float]]) -> list[list[float]]:
+        if len(path) < 2:
+            return path
+        repaired: list[list[float]] = [path[0]]
+        repairs = 0
+        max_repairs = 8
+        for point in path[1:]:
+            if len(point) < 2:
+                continue
+            prev = repaired[-1]
+            gap_km = self._haversine(
+                float(prev[1]),
+                float(prev[0]),
+                float(point[1]),
+                float(point[0]),
+            )
+            if gap_km <= 0.95 or repairs >= max_repairs:
+                repaired.append(point)
+                continue
+            bridge = self._build_visual_bridge(prev, point, gap_km)
+            if bridge:
+                if bridge[0] == prev:
+                    repaired.extend(bridge[1:])
                 else:
-                    values.extend(polyline[2:] if len(polyline) > 2 else polyline)
-        return values
+                    repaired.extend(bridge)
+                repairs += 1
+            else:
+                repaired.append(point)
+        return self._sanitize_path(repaired)
+
+    def _build_visual_bridge(
+        self,
+        from_point: list[float],
+        to_point: list[float],
+        gap_km: float,
+    ) -> list[list[float]]:
+        mode = "walking" if gap_km <= 1.2 else "driving"
+        try:
+            bridge_path, _, _ = self._request_route(
+                mode,
+                {"lat": float(from_point[1]), "lon": float(from_point[0])},
+                {"lat": float(to_point[1]), "lon": float(to_point[0])},
+            )
+            safe_bridge = self._sanitize_path(bridge_path)
+            return safe_bridge if len(safe_bridge) >= 2 else []
+        except Exception:
+            return []
 
     def _mode_sequence(self, preferred_mode: str) -> list[str]:
         if preferred_mode == "walk":

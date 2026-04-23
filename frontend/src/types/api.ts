@@ -22,6 +22,45 @@ export interface TripRequest {
   additional_notes?: string;
 }
 
+export type RouteTransportMode =
+  | "walking"
+  | "driving"
+  | "bicycling"
+  | "transit";
+
+export interface RoutePointInput {
+  lat: number;
+  lon: number;
+  label?: string;
+}
+
+export interface RoutePlanRequest {
+  mode: RouteTransportMode;
+  points: RoutePointInput[];
+  prefer_waypoints?: boolean;
+}
+
+export interface RoutePlanLeg {
+  from_index: number;
+  to_index: number;
+  status: string;
+  distance_km: number;
+  duration_minutes: number;
+  path: [number, number][];
+  warning?: string;
+}
+
+export interface RoutePlanResponse {
+  requested_mode: RouteTransportMode | string;
+  mode: RouteTransportMode | string;
+  status: "ok" | "partial" | "failed" | string;
+  distance_km: number;
+  duration_minutes: number;
+  path: [number, number][];
+  legs: RoutePlanLeg[];
+  warnings: string[];
+}
+
 export interface AgentTraceStep {
   agent_name: string;
   status?: "ok" | "fallback" | "warning" | string;
@@ -178,8 +217,16 @@ export interface BudgetSummary {
   lines: BudgetLine[];
 }
 
+export interface PlanConstraints {
+  preferred_areas?: string[];
+  avoid_tags?: string[];
+  must_include_spots?: string[];
+  must_include_spots_by_day?: Record<string, string[]>;
+}
+
 export interface TripPlan {
   request: TripRequest;
+  constraints?: PlanConstraints;
   days: DayPlan[];
   budget_summary: BudgetSummary;
   warnings: string[];

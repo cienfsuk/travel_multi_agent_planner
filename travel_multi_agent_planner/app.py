@@ -730,16 +730,44 @@ def _normalize_segment_path(path: list[list[float]], start_lon: float, start_lat
     normalized = [list(point) for point in path if isinstance(point, (list, tuple)) and len(point) >= 2]
     if not normalized:
         return []
-    normalized[0] = [start_lon, start_lat]
-    normalized[-1] = [end_lon, end_lat]
     deduped: list[list[float]] = []
     for point in normalized:
-        candidate = [float(point[0]), float(point[1])]
+        lon = float(point[0])
+        lat = float(point[1])
+        if _is_valid_lon_lat(lon, lat):
+            candidate = [lon, lat]
+        elif _is_valid_lon_lat(lat, lon):
+            candidate = [lat, lon]
+        else:
+            continue
         if not deduped or deduped[-1] != candidate:
             deduped.append(candidate)
     if len(deduped) <= 1:
         return []
+    # Keep Tencent official route geometry as-is; only snap endpoints when
+    # they're already very close to avoid creating artificial cross-water lines.
+    start_gap_km = _distance_km(deduped[0][1], deduped[0][0], start_lat, start_lon)
+    end_gap_km = _distance_km(deduped[-1][1], deduped[-1][0], end_lat, end_lon)
+    if start_gap_km <= 0.35:
+        deduped[0] = [float(start_lon), float(start_lat)]
+    if end_gap_km <= 0.35:
+        deduped[-1] = [float(end_lon), float(end_lat)]
     return deduped
+
+
+def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _is_valid_lon_lat(lon: float, lat: float) -> bool:
+    return math.isfinite(lon) and math.isfinite(lat) and -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0
 
 
 def _build_map_view_model(plan: TripPlan, selected_day_label: str) -> MapViewModel:
