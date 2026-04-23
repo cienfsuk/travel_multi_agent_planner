@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import requests
 
@@ -173,9 +174,11 @@ class TencentMapProvider:
         route = (result.get("routes") or [{}])[0]
         polyline = route.get("polyline") or self._extract_transit_polyline(route)
         path = self._decode_polyline(polyline)
-        distance_km = round(float(route.get("distance", 0.0)) / 1000, 2)
-        raw_duration_seconds = float(route.get("duration", 0.0) or 0.0)
-        duration = round(raw_duration_seconds / 60) if raw_duration_seconds > 0 else 0
+        safe_path = self._sanitize_path(path)
+        if safe_path:
+            path = safe_path
+        distance_km = self._extract_route_distance_km(route, path)
+        duration = self._extract_route_duration_minutes(route, distance_km, mode)
         if not path:
             raise RuntimeError("腾讯路径规划未返回有效路线，无法生成可靠方案。")
         return path, duration, distance_km
@@ -212,7 +215,8 @@ class TencentMapProvider:
         if len(decoded_path) < 2:
             raise RuntimeError("Driving route did not return a valid polyline.")
 
-        total_duration_minutes = max(1, round(float(route.get("duration", 0.0) or 0.0) / 60))
+        total_distance_km = self._extract_route_distance_km(route, decoded_path)
+        total_duration_minutes = self._extract_route_duration_minutes(route, total_distance_km, "driving")
         legs = self._split_polyline_into_legs(decoded_path, points, total_duration_minutes)
 
         return {
@@ -250,8 +254,10 @@ class TencentMapProvider:
                     [float(nxt["lon"]), float(nxt["lat"])],
                 ]
                 distance_km = round(self._haversine(current["lat"], current["lon"], nxt["lat"], nxt["lon"]), 3)
-                duration_minutes = max(1, round(distance_km / self._mode_speed_kmh(mode) * 60))
+                duration_minutes = max(0, round(distance_km / self._mode_speed_kmh(mode) * 60))
                 leg_status = "fallback"
+            if duration_minutes <= 0 and distance_km > 0:
+                duration_minutes = max(1, round(distance_km / self._mode_speed_kmh(mode) * 60))
 
             if len(safe_path) < 2:
                 safe_path = [
@@ -270,7 +276,7 @@ class TencentMapProvider:
                     "to_index": to_index,
                     "status": leg_status,
                     "distance_km": round(float(distance_km), 3),
-                    "duration_minutes": int(max(1, duration_minutes)),
+                    "duration_minutes": int(max(0, duration_minutes)),
                     "path": safe_path,
                     "warning": warning,
                 }
@@ -346,6 +352,7 @@ class TencentMapProvider:
         legs: list[dict] = []
         total_path_distance = self._path_distance_km(path)
         consumed_duration = 0
+        total_duration_minutes = max(0, int(round(total_duration_minutes)))
 
         for from_index in range(len(points) - 1):
             start_idx = route_indexes[from_index]
@@ -360,10 +367,10 @@ class TencentMapProvider:
                 ]
             leg_distance = self._path_distance_km(leg_path)
             if from_index == len(points) - 2:
-                leg_duration = max(1, total_duration_minutes - consumed_duration)
+                leg_duration = max(0, total_duration_minutes - consumed_duration)
             else:
                 ratio = 0.0 if total_path_distance <= 0 else leg_distance / total_path_distance
-                leg_duration = max(1, round(total_duration_minutes * ratio))
+                leg_duration = max(0, round(total_duration_minutes * ratio))
                 consumed_duration += leg_duration
 
             legs.append(
@@ -420,6 +427,125 @@ class TencentMapProvider:
 
     def _is_valid_lon_lat(self, lon: float, lat: float) -> bool:
         return -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0
+
+    def _extract_route_distance_km(self, route: dict, path: list[list[float]]) -> float:
+        direct_distance = self._parse_numeric(route.get("distance"))
+        if direct_distance > 0:
+            if direct_distance > 50:
+                return round(direct_distance / 1000, 3)
+            return round(direct_distance, 3)
+
+        steps = route.get("steps") or []
+        if isinstance(steps, list):
+            step_distance = 0.0
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                value = self._parse_numeric(step.get("distance"))
+                if value > 0:
+                    step_distance += value
+            if step_distance > 0:
+                if step_distance > 50:
+                    return round(step_distance / 1000, 3)
+                return round(step_distance, 3)
+
+        if path:
+            return round(self._path_distance_km(path), 3)
+        return 0.0
+
+    def _extract_route_duration_minutes(self, route: dict, distance_km: float, mode: str) -> int:
+        direct_candidates = [
+            route.get("duration"),
+            route.get("duration_in_traffic"),
+            route.get("time"),
+            route.get("cost_time"),
+            route.get("estimated_time"),
+        ]
+        for raw in direct_candidates:
+            value = self._parse_numeric(raw)
+            if value <= 0:
+                continue
+            return self._normalize_duration_minutes(value, distance_km, mode)
+
+        steps = route.get("steps") or []
+        if isinstance(steps, list) and steps:
+            step_minutes = 0
+            has_step_duration = False
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                raw_step_duration = self._parse_numeric(
+                    step.get("duration") or step.get("time") or step.get("cost_time")
+                )
+                if raw_step_duration <= 0:
+                    continue
+                step_distance = self._extract_route_distance_km(step, [])
+                step_minutes += self._normalize_duration_minutes(
+                    raw_step_duration,
+                    step_distance,
+                    mode,
+                )
+                has_step_duration = True
+            if has_step_duration:
+                return max(0, int(round(step_minutes)))
+
+        if distance_km > 0:
+            return max(1, round(distance_km / self._mode_speed_kmh(mode) * 60))
+        return 0
+
+    def _normalize_duration_minutes(self, raw_value: float, distance_km: float, mode: str) -> int:
+        if raw_value <= 0:
+            return 0
+        minutes_as_minutes = raw_value
+        minutes_as_seconds = raw_value / 60.0
+
+        if distance_km <= 0.05:
+            if raw_value >= 300:
+                return max(0, int(round(minutes_as_seconds)))
+            return max(0, int(round(minutes_as_minutes)))
+
+        expected_speed = self._mode_speed_kmh(mode)
+        min_speed, max_speed = self._mode_speed_bounds_kmh(mode)
+
+        def score(minutes: float) -> float:
+            minutes = max(minutes, 0.1)
+            speed = distance_km / (minutes / 60.0)
+            penalty = abs(math.log(max(speed, 0.1) / expected_speed))
+            if speed < min_speed or speed > max_speed:
+                penalty += 3.5
+            return penalty
+
+        score_minutes = score(minutes_as_minutes)
+        score_seconds = score(minutes_as_seconds)
+        chosen = minutes_as_seconds if score_seconds < score_minutes else minutes_as_minutes
+        return max(0, int(round(chosen)))
+
+    def _mode_speed_bounds_kmh(self, mode: str) -> tuple[float, float]:
+        if mode == "walking":
+            return (1.0, 8.0)
+        if mode == "bicycling":
+            return (3.0, 40.0)
+        if mode == "transit":
+            return (4.0, 100.0)
+        return (5.0, 140.0)
+
+    def _parse_numeric(self, value: object) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            if math.isfinite(float(value)):
+                return float(value)
+            return 0.0
+        text = str(value).strip()
+        if not text:
+            return 0.0
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return 0.0
+        try:
+            return float(match.group(0))
+        except Exception:
+            return 0.0
 
     def _get(self, url: str, params: dict) -> dict:
         return self._http.get(url, params)

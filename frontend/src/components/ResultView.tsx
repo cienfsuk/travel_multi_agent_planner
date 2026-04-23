@@ -75,6 +75,16 @@ function summarizeStepTransport(step: AnimationStep) {
   return `${step.next_transport_type} · ${detailParts.join(" · ")}`;
 }
 
+function transportModeLabel(mode: RouteTransportMode): string {
+  const labels: Record<RouteTransportMode, string> = {
+    driving: "自驾/观光车",
+    walking: "步行",
+    bicycling: "骑行",
+    transit: "公共交通",
+  };
+  return labels[mode];
+}
+
 function computeLegPlaybackMs(
   leg: RoutePlanLeg | null,
   speed: "slow" | "normal" | "fast",
@@ -219,28 +229,18 @@ export default function ResultView({ result }: Props) {
   const routeInputPoints = useMemo(() => {
     return filteredAnimSteps
       .map((step) => stepNodeLookup.get(`${step.day}-${step.step_index}`))
-      .filter(Boolean)
-      .reduce<Array<{ lat: number; lon: number; label: string }>>(
-        (acc, node) => {
-          if (!node) {
-            return acc;
-          }
-          const previous = acc[acc.length - 1];
-          if (
-            previous &&
-            Math.abs(previous.lat - node.lat) < 1e-6 &&
-            Math.abs(previous.lon - node.lon) < 1e-6
-          ) {
-            return acc;
-          }
-          acc.push({
-            lat: node.lat,
-            lon: node.lon,
-            label: node.title,
-          });
-          return acc;
-        },
-        [],
+      .map((node) =>
+        node
+          ? {
+              lat: node.lat,
+              lon: node.lon,
+              label: node.title,
+            }
+          : null,
+      )
+      .filter(
+        (node): node is { lat: number; lon: number; label: string } =>
+          node !== null,
       );
   }, [filteredAnimSteps, stepNodeLookup]);
   const routeInputSignature = useMemo(
@@ -269,6 +269,33 @@ export default function ResultView({ result }: Props) {
     }
     return routePlan.warnings.slice(0, 2).join("; ");
   }, [routePlan?.warnings]);
+  const routeModeDisplay = useMemo(
+    () => transportModeLabel(mapTransportMode),
+    [mapTransportMode],
+  );
+  const stepTransportSummary = useMemo(() => {
+    return filteredAnimSteps.map((step, idx) => {
+      const leg = routePlan?.legs?.[idx];
+      if (leg && Array.isArray(leg.path) && leg.path.length >= 2) {
+        const duration = Math.max(0, Number(leg.duration_minutes || 0));
+        const distance = Math.max(0, Number(leg.distance_km || 0));
+        const summary = `${routeModeDisplay} · ${duration} min · ${distance.toFixed(1)} km`;
+        const detail = leg.warning?.trim()
+          ? leg.warning.trim()
+          : leg.status && leg.status !== "ok"
+            ? `Route status: ${leg.status}`
+            : "";
+        return {
+          summary,
+          detail,
+        };
+      }
+      return {
+        summary: summarizeStepTransport(step),
+        detail: step.next_transport_desc || "",
+      };
+    });
+  }, [filteredAnimSteps, routePlan?.legs, routeModeDisplay]);
 
   const currentAnimStep = filteredAnimSteps[mapStepIndex] || null;
 
@@ -920,7 +947,7 @@ export default function ResultView({ result }: Props) {
                     : routeError
                       ? `路线规划失败：${routeError}`
                       : routePlan
-                        ? `导航模式：${mapTransportMode} · 状态：${routePlan.status}${
+                        ? `导航模式：${routeModeDisplay} · 状态：${routePlan.status}${
                             routeWarningsText ? ` · ${routeWarningsText}` : ""
                           }`
                         : "未返回可用导航路线，将使用已有路径信息。"}
@@ -1035,14 +1062,14 @@ export default function ResultView({ result }: Props) {
                             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                               下一段交通
                             </div>
-                            {summarizeStepTransport(step) ? (
+                            {stepTransportSummary[idx]?.summary ? (
                               <>
                                 <div className="mt-1 text-xs font-medium text-slate-700 dark:text-slate-200">
-                                  {summarizeStepTransport(step)}
+                                  {stepTransportSummary[idx]?.summary}
                                 </div>
-                                {step.next_transport_desc && (
+                                {stepTransportSummary[idx]?.detail && (
                                   <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                                    {step.next_transport_desc}
+                                    {stepTransportSummary[idx]?.detail}
                                   </div>
                                 )}
                               </>
