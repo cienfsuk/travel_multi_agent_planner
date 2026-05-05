@@ -329,6 +329,98 @@ export interface CaseSummary {
   generated_at: string;
 }
 
+export interface PersonalizationTraceItem {
+  stage: string;
+  agent: string;
+  status: string;
+  summary: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PersonalizationImpactReport {
+  risk_level: string;
+  impacted_files: string[];
+  impacted_agents: string[];
+  summary: string;
+}
+
+export interface PersonalizationReviewResult {
+  passed: boolean;
+  recommendation: string;
+  llm_review_used?: boolean;
+  repair_recommended?: boolean;
+  issues: Array<{
+    severity: string;
+    category: string;
+    message: string;
+    suggestion: string;
+  }>;
+}
+
+export interface PersonalizationValidationResult {
+  success: boolean;
+  message: string;
+  runtime_signature_ok: boolean;
+  tests_failed: string[];
+  smoke_checks: string[];
+}
+
+export interface PersonalizationPatch {
+  patch_id: string;
+  patches: Array<{
+    file_path: string;
+    operation: string;
+    new_snippet: string;
+    diff_lines: string[];
+  }>;
+}
+
+export interface PersonalizationSubRequirement {
+  id: string;
+  text: string;
+  target_agent: string;
+  target_method: string;
+  generation_source: string;
+  attempt_count: number;
+  repair_attempts: number;
+  review_passed: boolean;
+  validation_success: boolean;
+  runtime_signature_ok: boolean;
+  blocking_issues: string[];
+}
+
+export interface PersonalizationResult {
+  requirement_id: string;
+  raw_requirement?: string;
+  modification_type?: string;
+  target_files?: string[];
+  modification_patch?: PersonalizationPatch;
+  impact_report?: PersonalizationImpactReport;
+  review_result?: PersonalizationReviewResult;
+  requires_confirmation?: boolean;
+  status?: string;
+  error_message?: string;
+  agent_trace?: PersonalizationTraceItem[];
+  sub_requirements?: PersonalizationSubRequirement[];
+  attempt_count?: number;
+  repair_attempts?: number;
+  final_generation_source?: string;
+  stage_statuses?: Record<string, string>;
+  blocking_issues?: string[];
+  explanation?: {
+    summary?: string;
+    review_recommendation?: string;
+    validation?: PersonalizationValidationResult;
+    validation_message?: string;
+  };
+}
+
+export interface PersonalizationApplyResult {
+  success?: boolean;
+  apply_message?: string;
+  blocking_issues?: string[];
+}
+
 // SSE streaming events
 export type SSEEvent =
   | { type: "heartbeat" }

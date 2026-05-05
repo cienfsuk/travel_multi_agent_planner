@@ -19,6 +19,36 @@ class BailianLLMProvider:
     def is_available(self) -> bool:
         return bool(self.api_key)
 
+    async def generate(self, prompt: str, system_prompt: str | None = None, temperature: float = 0.3) -> str | None:
+        """Backward-compatible async text generation wrapper."""
+        return self.generate_text(system_prompt or "You are a helpful assistant.", prompt, temperature=temperature)
+
+    def generate_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str | None:
+        """Unified text generation entrypoint for personalization agents."""
+        return self._chat_text(system_prompt=system_prompt, user_prompt=user_prompt, temperature=temperature)
+
+    def generate_json(
+        self,
+        system_prompt: str,
+        user_payload: object,
+        schema_hint: str = "",
+        temperature: float = 0.1,
+    ) -> dict | list | None:
+        """Unified JSON generation entrypoint for personalization agents."""
+        payload = user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False)
+        prompt = payload if not schema_hint else f"{payload}\n\nJSON_SCHEMA_HINT:\n{schema_hint}"
+        return self._chat_json(system_prompt=system_prompt, user_prompt=prompt, temperature=temperature)
+
+    def generate_code(self, system_prompt: str, user_payload: object, temperature: float = 0.2) -> str | None:
+        """Unified code generation entrypoint for personalization agents."""
+        payload = user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False)
+        return self._chat_text(system_prompt=system_prompt, user_prompt=payload, temperature=temperature)
+
+    def generate_repair(self, system_prompt: str, user_payload: object, temperature: float = 0.15) -> str | None:
+        """Unified repair generation entrypoint for personalization agents."""
+        payload = user_payload if isinstance(user_payload, str) else json.dumps(user_payload, ensure_ascii=False)
+        return self._chat_text(system_prompt=system_prompt, user_prompt=payload, temperature=temperature)
+
     def generate_constraints(self, request_text: str, user_form: dict) -> TravelConstraints | None:
         if not self.is_available():
             return None
@@ -244,8 +274,8 @@ class BailianLLMProvider:
         except Exception:
             return None
 
-    def _chat_json(self, system_prompt: str, user_prompt: str) -> dict | list | None:
-        text = self._chat_text(system_prompt, user_prompt)
+    def _chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> dict | list | None:
+        text = self._chat_text(system_prompt, user_prompt, temperature=temperature)
         if not text:
             return None
         try:
@@ -267,7 +297,7 @@ class BailianLLMProvider:
                     pass
         return None
 
-    def _chat_text(self, system_prompt: str, user_prompt: str) -> str | None:
+    def _chat_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str | None:
         if not self.api_key:
             return None
         headers = {
@@ -280,7 +310,7 @@ class BailianLLMProvider:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.3,
+            "temperature": temperature,
         }
         try:
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=self.timeout)

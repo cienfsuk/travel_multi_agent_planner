@@ -82,7 +82,7 @@ export default function LoadingView({ events, error }: Props) {
                 <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
                 <span>
                   {hasTraces
-                    ? "Agent 委员会正在处理您的请求..."
+                    ? "多智能体正在协同处理您的请求..."
                     : "正在连接多智能体系统..."}
                 </span>
               </>
@@ -94,7 +94,7 @@ export default function LoadingView({ events, error }: Props) {
         <div className="p-6 h-80 overflow-y-auto space-y-4">
           {visibleLogs.length === 0 && !error && (
             <div className="text-slate-500 animate-pulse">
-              等待 Agent 响应...
+              等待智能体响应...
             </div>
           )}
           {visibleLogs.map((log, i) => (

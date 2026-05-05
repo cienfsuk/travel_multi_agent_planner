@@ -51,3 +51,11 @@ frontend/coverage/
 frontend/.cache/
 frontend/.eslintcache
 frontend/*.tsbuildinfo
+
+# Local assistant/runtime state
+.claude/settings.local.json
+tmp_plan_stream.txt
+personalization/patches/
+personalization/extensions/llm_*.py
+personalization/extensions/repaired_*.py
+personalization/extensions/template_*.py

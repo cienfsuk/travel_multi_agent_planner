@@ -299,24 +299,25 @@ class FakeTencentSearchProvider:
     def search_along_route_foods(self, city_name: str, path, tastes: list[str], radius_meters: int = 2000):
         if not path:
             return []
+        taste_label = str(tastes[0]).strip() if tastes else "地方风味"
         foods = []
         for index, point in enumerate(path[:6], start=1):
             lat = point[1]
             lon = point[0]
             foods.append(
                 FoodVenue(
-                    f"{city_name}沿途餐馆{index}",
+                    f"{city_name}{taste_label}沿途餐馆{index}",
                     city_name,
-                    "地方风味",
+                    taste_label,
                     f"沿途补充餐饮候选，半径 {radius_meters} 米",
                     62.0 + index * 7.0,
                     ["food", "沿途候选"],
-                    taste_profile=tastes[:1] or ["鲜"],
+                    taste_profile=[taste_label],
                     meal_suitability="both",
                     lat=lat,
                     lon=lon,
                     address=f"{city_name}沿途商圈{index}",
-                    source_evidence=self._evidence(city_name, f"{city_name}沿途餐馆{index}"),
+                    source_evidence=self._evidence(city_name, f"{city_name}{taste_label}沿途餐馆{index}"),
                 )
             )
         return foods
@@ -330,40 +331,42 @@ class FakeTencentSearchProvider:
         radius_meters: int,
         meal_type: str,
     ):
+        taste_label = str(tastes[0]).strip() if tastes else "地方风味"
         return [
             FoodVenue(
-                f"{city_name}附近餐馆{radius_meters}-{index}",
+                f"{city_name}{taste_label}附近餐馆{radius_meters}-{index}",
                 city_name,
-                "地方风味",
+                taste_label,
                 f"附近补充候选，半径 {radius_meters} 米",
                 48.0 + index * 9.0,
                 ["food", "附近候选"],
-                taste_profile=tastes[:2] or ["鲜", "辣"],
+                taste_profile=tastes[:2] or [taste_label],
                 meal_suitability=meal_type if meal_type in {"lunch", "dinner"} else "both",
                 lat=center_lat + 0.0007 * index,
                 lon=center_lon + 0.0006 * index,
                 address=f"{city_name}附近商圈{radius_meters}-{index}",
-                source_evidence=self._evidence(city_name, f"{city_name}附近餐馆{radius_meters}-{index}"),
+                source_evidence=self._evidence(city_name, f"{city_name}{taste_label}附近餐馆{radius_meters}-{index}"),
             )
             for index in range(1, 3)
         ]
 
     def search_area_foods(self, city_name: str, area_hint: str, tastes: list[str], meal_type: str):
         area = area_hint.strip() or "中心区"
+        taste_label = str(tastes[0]).strip() if tastes else "地方风味"
         return [
             FoodVenue(
-                f"{city_name}{area}区域餐馆{index}",
+                f"{city_name}{area}{taste_label}区域餐馆{index}",
                 city_name,
-                "地方风味",
+                taste_label,
                 f"{area} 区域补充候选",
                 52.0 + index * 12.0,
                 ["food", "区域候选"],
-                taste_profile=tastes[:2] or ["鲜", "辣"],
+                taste_profile=tastes[:2] or [taste_label],
                 meal_suitability=meal_type if meal_type in {"lunch", "dinner"} else "both",
                 lat=self.city_coords[city_name][0] + 0.0012 * index,
                 lon=self.city_coords[city_name][1] - 0.001 * index,
                 address=f"{area}区域餐馆{index}",
-                source_evidence=self._evidence(city_name, f"{city_name}{area}区域餐馆{index}"),
+                source_evidence=self._evidence(city_name, f"{city_name}{area}{taste_label}区域餐馆{index}"),
             )
             for index in range(1, 3)
         ]
@@ -445,6 +448,127 @@ class FakeIntercityProvider:
                 travel_date=travel_date,
             )
         ][:limit]
+
+
+class EarlyDepartureIntercityProvider(FakeIntercityProvider):
+    def query_options(self, origin_city: str, destination_city: str, travel_date: str, limit: int = 5):
+        return [
+            IntercityOption(
+                mode="rail",
+                transport_code="G1001",
+                from_station=f"{origin_city}站",
+                to_station=f"{destination_city}站",
+                depart_time="06:05",
+                arrive_time="07:40",
+                duration_minutes=95,
+                price_cny=98.0,
+                seat_label="二等座",
+                queried_at="2026-04-13T15:20:00+08:00",
+                source_name="中国铁路12306",
+                source_url=f"https://kyfw.12306.cn/otn/leftTicket/init?date={travel_date}",
+                travel_date=travel_date,
+            ),
+            IntercityOption(
+                mode="rail",
+                transport_code="G2002",
+                from_station=f"{origin_city}站",
+                to_station=f"{destination_city}站",
+                depart_time="09:12",
+                arrive_time="10:52",
+                duration_minutes=100,
+                price_cny=102.0,
+                seat_label="二等座",
+                queried_at="2026-04-13T15:20:00+08:00",
+                source_name="中国铁路12306",
+                source_url=f"https://kyfw.12306.cn/otn/leftTicket/init?date={travel_date}",
+                travel_date=travel_date,
+            ),
+        ][:limit]
+
+
+class NonMatchingSupplementalFoodProvider(FakeTencentSearchProvider):
+    def _supplemental_taste(self, tastes: list[str]) -> str:
+        joined = " ".join(str(item) for item in tastes)
+        return "日料" if "日料" in joined or "日本" in joined or "寿司" in joined else "地方风味"
+
+    def search_along_route_foods(self, city_name: str, path, tastes: list[str], radius_meters: int = 2000):
+        taste = self._supplemental_taste(tastes)
+        foods = super().search_along_route_foods(city_name, path, [taste], radius_meters)
+        for food in foods:
+            food.name = food.name.replace(taste, f"{taste}补充")
+            food.cuisine = taste
+            food.taste_profile = [taste]
+        return foods
+
+    def search_nearby_foods(
+        self,
+        city_name: str,
+        center_lat: float,
+        center_lon: float,
+        tastes: list[str],
+        radius_meters: int,
+        meal_type: str,
+    ):
+        taste = self._supplemental_taste(tastes)
+        foods = super().search_nearby_foods(city_name, center_lat, center_lon, [taste], radius_meters, meal_type)
+        for food in foods:
+            food.name = food.name.replace(taste, f"{taste}补充")
+            food.cuisine = taste
+            food.taste_profile = [taste]
+        return foods
+
+    def search_area_foods(self, city_name: str, area_hint: str, tastes: list[str], meal_type: str):
+        taste = self._supplemental_taste(tastes)
+        foods = super().search_area_foods(city_name, area_hint, [taste], meal_type)
+        for food in foods:
+            food.name = food.name.replace(taste, f"{taste}补充")
+            food.cuisine = taste
+            food.taste_profile = [taste]
+        return foods
+
+
+class SnackHeavyFoodProvider(FakeTencentSearchProvider):
+    def search_nearby_foods(
+        self,
+        city_name: str,
+        center_lat: float,
+        center_lon: float,
+        tastes: list[str],
+        radius_meters: int,
+        meal_type: str,
+    ):
+        if meal_type != "dinner":
+            return super().search_nearby_foods(city_name, center_lat, center_lon, tastes, radius_meters, meal_type)
+        return [
+            FoodVenue(
+                f"{city_name}冰糖葫芦旗舰店",
+                city_name,
+                "甜品饮品",
+                "晚餐附近高曝光零食候选",
+                500.0,
+                ["food", "附近候选", "甜"],
+                taste_profile=["甜"],
+                meal_suitability="dinner",
+                lat=center_lat,
+                lon=center_lon,
+                address=f"{city_name}景区门口",
+                source_evidence=self._evidence(city_name, f"{city_name}冰糖葫芦旗舰店"),
+            ),
+            FoodVenue(
+                f"{city_name}本地正餐馆",
+                city_name,
+                "本地菜",
+                "适合晚餐的正餐候选",
+                92.0,
+                ["food", "附近候选", "鲜"],
+                taste_profile=["鲜"],
+                meal_suitability="dinner",
+                lat=center_lat + 0.0005,
+                lon=center_lon + 0.0005,
+                address=f"{city_name}商圈正餐",
+                source_evidence=self._evidence(city_name, f"{city_name}本地正餐馆"),
+            ),
+        ]
 
 
 class TravelPlannerTests(unittest.TestCase):
@@ -612,6 +736,151 @@ class TravelPlannerTests(unittest.TestCase):
             persistence.LATEST_CASE_PATH = original_latest_case
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
+
+    def test_intercity_selection_avoids_over_early_departures(self) -> None:
+        transport = TransportAgent(intercity_provider=EarlyDepartureIntercityProvider())
+        choice = transport._resolve_intercity_option("Shanghai", "Nanjing", "2026-04-14")
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice.transport_code, "G2002")  # type: ignore[union-attr]
+        self.assertEqual(choice.depart_time, "09:12")  # type: ignore[union-attr]
+
+    def test_summary_markdown_contains_chinese_preferences_and_personalized_notes(self) -> None:
+        orchestrator = self.build_orchestrator()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=2,
+                budget=1500,
+                origin="Shanghai",
+                interests=["culture", "food", "nature"],
+                food_tastes=["鲜", "辣"],
+                preferred_areas=["玄武湖"],
+                must_have_hotel_area="玄武湖",
+                additional_notes="第一天晚饭想吃火锅，第二天晚上想吃烧烤，出发不要太早。",
+            )
+        )
+        self.assertIn("兴趣偏好：文化、美食、自然", plan.summary_markdown)
+        self.assertIn("补充要求：第一天晚饭想吃火锅，第二天晚上想吃烧烤，出发不要太早。", plan.summary_markdown)
+        self.assertIn("酒店区域偏好：玄武湖", plan.summary_markdown)
+        self.assertIn("理由：", plan.summary_markdown)
+
+        self.assertIn("## 个性化餐饮落地", plan.summary_markdown)
+        self.assertIn("## 个性化交通落地", plan.summary_markdown)
+
+    def test_transport_personalization_pushes_departure_later_in_final_plan(self) -> None:
+        orchestrator = self.build_orchestrator()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=2,
+                budget=1500,
+                origin="Shanghai",
+                additional_notes="第一天出发不要太早。",
+            )
+        )
+        arrival = plan.day_plans[0].arrival_segment
+        self.assertIsNotNone(arrival)
+        self.assertEqual(arrival.depart_time, "09:00")  # type: ignore[union-attr]
+        self.assertEqual(arrival.arrive_time, "10:50")  # type: ignore[union-attr]
+        self.assertEqual(arrival.confidence, "personalized")  # type: ignore[union-attr]
+        self.assertIn("已避开过早车次", arrival.description)  # type: ignore[union-attr]
+        self.assertTrue(any("个性化" in note for note in plan.day_plans[0].notes))
+
+    def test_personalized_meals_use_real_candidates_with_evidence(self) -> None:
+        orchestrator = self.build_orchestrator()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=2,
+                budget=1500,
+                origin="Shanghai",
+                interests=["culture", "food", "nature"],
+                additional_notes="第一天晚上想吃火锅，第二天晚上想吃烧烤。",
+            )
+        )
+        dinner_meals = [
+            meal
+            for day in plan.day_plans
+            for meal in day.meals
+            if meal.meal_type == "dinner"
+        ]
+        self.assertEqual(len(dinner_meals), 2)
+        for meal in dinner_meals:
+            self.assertNotEqual(meal.selection_tier, "personalized-placeholder")
+            self.assertTrue(meal.source_evidence)
+        self.assertEqual(len({meal.venue_name for meal in dinner_meals}), len(dinner_meals))
+
+        meal_evidence_issues = [
+            issue for issue in plan.validation_issues if issue.category == "meal-evidence"
+        ]
+        self.assertFalse(meal_evidence_issues)
+
+    def test_generic_multi_day_meal_preferences_are_applied(self) -> None:
+        orchestrator = self.build_orchestrator()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=3,
+                budget=1800,
+                origin="Shanghai",
+                interests=["culture", "food", "nature"],
+                additional_notes="第一天想吃海鲜，第二天想吃日料，第三天中午想吃面。",
+            )
+        )
+        day1_dinner = next(meal for meal in plan.day_plans[0].meals if meal.meal_type == "dinner")
+        day2_dinner = next(meal for meal in plan.day_plans[1].meals if meal.meal_type == "dinner")
+        day3_lunch = next(meal for meal in plan.day_plans[2].meals if meal.meal_type == "lunch")
+        self.assertEqual(day1_dinner.selection_tier, "personalized")
+        self.assertEqual(day2_dinner.selection_tier, "personalized")
+        self.assertEqual(day3_lunch.selection_tier, "personalized")
+        self.assertTrue("海鲜" in day1_dinner.venue_name or "海鲜" in day1_dinner.cuisine)
+        self.assertTrue("日料" in day2_dinner.venue_name or "日料" in day2_dinner.cuisine)
+        self.assertTrue("面" in day3_lunch.venue_name or "面" in day3_lunch.cuisine)
+
+    def test_unmatched_personalized_meal_keeps_real_meal_and_lists_supplemental_candidates(self) -> None:
+        orchestrator = self.build_orchestrator()
+        orchestrator.search_provider = NonMatchingSupplementalFoodProvider()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=2,
+                budget=1800,
+                origin="Shanghai",
+                interests=["culture", "food", "nature"],
+                additional_notes="第二天晚上想吃日料。",
+            )
+        )
+        day2_dinner = next(meal for meal in plan.day_plans[1].meals if meal.meal_type == "dinner")
+        self.assertNotEqual(day2_dinner.selection_tier, "personalized-placeholder")
+        self.assertTrue(day2_dinner.source_evidence)
+        day2_notes = "\n".join(plan.day_plans[1].notes)
+        self.assertIn("原真实餐饮候选", day2_notes)
+        self.assertIn("腾讯API附近个性化候选", day2_notes)
+        self.assertIn("日料", day2_notes)
+        self.assertIn("## 个性化餐饮落地", plan.summary_markdown)
+        self.assertIn("腾讯API附近个性化候选", plan.summary_markdown)
+        self.assertIn("日料", plan.summary_markdown)
+
+    def test_dinner_does_not_use_snack_or_dessert_candidates(self) -> None:
+        orchestrator = self.build_orchestrator()
+        orchestrator.search_provider = SnackHeavyFoodProvider()
+        plan = orchestrator.create_plan(
+            TripRequest(
+                destination="Nanjing",
+                days=2,
+                budget=1800,
+                origin="Shanghai",
+                interests=["food", "night"],
+                food_tastes=["甜"],
+            )
+        )
+        dinners = [meal for day in plan.day_plans for meal in day.meals if meal.meal_type == "dinner"]
+        self.assertTrue(dinners)
+        for meal in dinners:
+            self.assertNotIn("冰糖葫芦", meal.venue_name)
+            self.assertNotIn("糖葫芦", meal.venue_name)
+            self.assertNotEqual(meal.cuisine, "甜品饮品")
+            self.assertGreaterEqual(meal.estimated_cost, 68.0)
 
 
 if __name__ == "__main__":

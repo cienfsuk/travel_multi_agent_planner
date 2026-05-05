@@ -1,5 +1,7 @@
 import type {
   CaseSummary,
+  PersonalizationApplyResult,
+  PersonalizationResult,
   PlanResponse,
   RoutePlanRequest,
   RoutePlanResponse,
@@ -58,6 +60,45 @@ export async function fetchRoutePlan(
     }
   }
   return res.json();
+}
+
+export async function processPersonalizationRequirement(
+  userText: string,
+): Promise<PersonalizationResult> {
+  const res = await fetch(`${BASE}/personalize/process`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_text: userText }),
+  });
+  if (!res.ok) throw new Error(await readApiError(res));
+  return res.json();
+}
+
+export async function applyPersonalizationModification(
+  requirementId: string,
+  saveExtensions: boolean,
+): Promise<PersonalizationApplyResult> {
+  const res = await fetch(`${BASE}/personalize/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requirement_id: requirementId,
+      approved: true,
+      save_extensions: saveExtensions,
+    }),
+  });
+  if (!res.ok) throw new Error(await readApiError(res));
+  return res.json();
+}
+
+async function readApiError(res: Response): Promise<string> {
+  const raw = await res.text();
+  try {
+    const parsed = JSON.parse(raw) as { detail?: string };
+    return parsed.detail || raw || `HTTP ${res.status}`;
+  } catch {
+    return raw || `HTTP ${res.status}`;
+  }
 }
 
 /**

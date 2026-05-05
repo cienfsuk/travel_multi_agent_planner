@@ -47,40 +47,110 @@ class TencentMapSearchProvider:
     def confirm_city(self, city_name: str) -> CityMatch:
         self._ensure_key()
         normalized_query = self._normalize_city_name(city_name)
+        try:
+            payload = self._get(
+                "https://apis.map.qq.com/ws/geocoder/v1/",
+                {
+                    "address": normalized_query,
+                    "key": self.api_key,
+                },
+            )
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Unable to confirm city: {city_name}")
+
+            components = result.get("address_components", {}) or {}
+            ad_info = result.get("ad_info", {}) or {}
+            location = result.get("location", {}) or {}
+            country = str(components.get("nation") or ad_info.get("nation") or "中国")
+            confirmed_city = str(components.get("city") or ad_info.get("city") or normalized_query).replace("?", "")
+            province = str(components.get("province") or "")
+            city_code = str(ad_info.get("adcode") or "")
+            if country != "中国":
+                raise RuntimeError(f"City is outside China: {city_name}")
+            if not self._city_matches_expected(normalized_query, confirmed_city):
+                raise RuntimeError(f"City mismatch: expected {city_name}, got {confirmed_city}")
+
+            return CityMatch(
+                input_name=city_name,
+                normalized_query=normalized_query,
+                confirmed_name=confirmed_city,
+                region=province,
+                country=country,
+                provider="腾讯位置服务",
+                lat=float(location.get("lat", 0.0)),
+                lon=float(location.get("lng", 0.0)),
+                city_code=city_code,
+            )
+        except Exception:
+            return self._confirm_city_from_district_list(city_name, normalized_query)
+
+    def _confirm_city_from_district_list(self, city_name: str, normalized_query: str) -> CityMatch:
         payload = self._get(
-            "https://apis.map.qq.com/ws/geocoder/v1/",
+            "https://apis.map.qq.com/ws/district/v1/list",
             {
-                "address": normalized_query,
                 "key": self.api_key,
             },
         )
         result = payload.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError(f"未能确认城市：{city_name}")
+        if not isinstance(result, list) or not result:
+            raise RuntimeError(f"Unable to confirm city: {city_name}")
 
-        components = result.get("address_components", {}) or {}
-        ad_info = result.get("ad_info", {}) or {}
-        location = result.get("location", {}) or {}
-        country = str(components.get("nation") or ad_info.get("nation") or "中国")
-        confirmed_city = str(components.get("city") or ad_info.get("city") or normalized_query).replace("市", "")
-        province = str(components.get("province") or "")
-        city_code = str(ad_info.get("adcode") or "")
-        if country != "中国":
-            raise RuntimeError(f"城市确认失败：{city_name} 未落在中国范围内。")
-        if not self._city_matches_expected(normalized_query, confirmed_city):
-            raise RuntimeError(f"城市确认失败：输入 {city_name}，但在线结果命中了 {confirmed_city}。")
+        provinces = result[0] if len(result) > 0 and isinstance(result[0], list) else []
+        cities = result[1] if len(result) > 1 and isinstance(result[1], list) else []
 
-        return CityMatch(
-            input_name=city_name,
-            normalized_query=normalized_query,
-            confirmed_name=confirmed_city,
-            region=province,
-            country=country,
-            provider="腾讯位置服务",
-            lat=float(location.get("lat", 0.0)),
-            lon=float(location.get("lng", 0.0)),
-            city_code=city_code,
-        )
+        def normalize_name(value: str) -> str:
+            return str(value or "").replace("?", "").replace("?", "").replace("?", "").strip().lower()
+
+        expected_norm = normalize_name(normalized_query)
+        province_by_city_id: dict[str, str] = {}
+        for province in provinces:
+            if not isinstance(province, dict):
+                continue
+            province_name = str(province.get("fullname") or province.get("name") or "")
+            cidx = province.get("cidx")
+            if not isinstance(cidx, list) or len(cidx) != 2:
+                continue
+            start, end = cidx
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            for city in cities[start : end + 1]:
+                if not isinstance(city, dict):
+                    continue
+                city_id = str(city.get("id") or "")
+                if city_id:
+                    province_by_city_id[city_id] = province_name
+
+        candidates = cities if cities else provinces
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            confirmed_name = str(item.get("name") or item.get("fullname") or "")
+            fullname = str(item.get("fullname") or confirmed_name)
+            if not (
+                self._city_matches_expected(normalized_query, confirmed_name)
+                or self._city_matches_expected(normalized_query, fullname)
+                or normalize_name(confirmed_name) == expected_norm
+                or normalize_name(fullname) == expected_norm
+            ):
+                continue
+
+            location = item.get("location", {}) or {}
+            city_id = str(item.get("id") or "")
+            region = province_by_city_id.get(city_id) or fullname
+            return CityMatch(
+                input_name=city_name,
+                normalized_query=normalized_query,
+                confirmed_name=confirmed_name.replace("?", ""),
+                region=region.replace("?", ""),
+                country="中国",
+                provider="腾讯位置服务（行政区划回退）",
+                lat=float(location.get("lat", 0.0)),
+                lon=float(location.get("lng", 0.0)),
+                city_code=city_id,
+            )
+
+        raise RuntimeError(f"Unable to match city: {city_name}")
 
     def build_city_profile(self, destination_match: CityMatch, tastes: list[str]) -> tuple[CityProfile, list[str]]:
         city_name = destination_match.confirmed_name
@@ -445,23 +515,23 @@ class TencentMapSearchProvider:
         queries = self._food_keywords(city_name, tastes)
         route_foods: list[FoodVenue] = []
         seen: set[str] = set()
-        for query in queries:
-            for item in self.alongby_search(query, path, city_name, page_size=6, radius_meters=radius_meters):
-                item = self._enrich_place_item(item)
+        for query in queries[:6]:
+            for item in self.alongby_search(query, path, city_name, page_size=8, radius_meters=radius_meters):
                 title = str(item.get("title") or item.get("name") or "").strip()
                 address = str(item.get("address") or "").strip().lower()
                 dedupe_key = f"{title.lower()}|{address}"
-                if not title or dedupe_key in seen:
+                if not title or dedupe_key in seen or not self._is_main_meal_place(title, "both"):
                     continue
                 seen.add(dedupe_key)
                 lat, lon = self._item_latlon(item)
+                cuisine = self._infer_cuisine(title, tastes)
                 route_foods.append(
                     FoodVenue(
                         name=title,
                         district=self._district_from_address(str(item.get("address", city_name)), city_name),
-                        cuisine=self._infer_cuisine(title, tastes),
+                        cuisine=cuisine,
                         description=str(item.get("detail_description") or item.get("address") or f"{city_name} 沿途餐饮"),
-                        average_cost=56.0 + len(route_foods) * 11.0,
+                        average_cost=self._estimate_food_cost(title, cuisine, "both", len(route_foods)),
                         tags=["food", "沿途候选", *tastes[:2]],
                         taste_profile=tastes[:2] or ["鲜"],
                         meal_suitability="both",
@@ -471,9 +541,9 @@ class TencentMapSearchProvider:
                         source_evidence=[self._poi_evidence(item, "沿途餐饮")],
                     )
                 )
-                if len(route_foods) >= 8:
+                if len(route_foods) >= 12:
                     return route_foods
-            if len(route_foods) >= 6:
+            if len(route_foods) >= 10:
                 break
         return route_foods
 
@@ -488,28 +558,28 @@ class TencentMapSearchProvider:
     ) -> list[FoodVenue]:
         raw_items: list[dict] = []
         boundary = f"nearby({center_lat:.6f},{center_lon:.6f},{radius_meters},0)"
-        for keyword in self._food_keywords(city_name, tastes, meal_type):
+        for keyword in self._food_keywords(city_name, tastes, meal_type)[:5]:
             try:
-                raw_items.extend(self._place_search(keyword, city_name, page_size=6, boundary=boundary))
+                raw_items.extend(self._place_search(keyword, city_name, page_size=10, boundary=boundary))
             except Exception:
                 continue
-            if len(raw_items) >= 12:
+            if len(raw_items) >= 24:
                 break
-        return self._food_candidates_from_items(raw_items, city_name, tastes, meal_type, "近邻候选", limit=10)
+        return self._food_candidates_from_items(raw_items, city_name, tastes, meal_type, "近邻候选", limit=16)
 
     def search_area_foods(self, city_name: str, area_hint: str, tastes: list[str], meal_type: str) -> list[FoodVenue]:
         area_text = (area_hint or "").strip()
         if not area_text:
             return []
         raw_items: list[dict] = []
-        for keyword in self._food_keywords(city_name, tastes, meal_type, area_hint=area_text):
+        for keyword in self._food_keywords(city_name, tastes, meal_type, area_hint=area_text)[:5]:
             try:
-                raw_items.extend(self._place_search(keyword, city_name, page_size=6))
+                raw_items.extend(self._place_search(keyword, city_name, page_size=10))
             except Exception:
                 continue
-            if len(raw_items) >= 10:
+            if len(raw_items) >= 24:
                 break
-        return self._food_candidates_from_items(raw_items, city_name, tastes, meal_type, "区域候选", limit=10)
+        return self._food_candidates_from_items(raw_items, city_name, tastes, meal_type, "区域候选", limit=16)
 
     def search_travel_notes(self, request, profile: CityProfile, llm_provider: object | None = None) -> list[TravelNote]:
         if llm_provider and hasattr(llm_provider, "compose_itinerary_with_notes"):
@@ -663,14 +733,24 @@ class TencentMapSearchProvider:
 
     def _food_keywords(self, city_name: str, tastes: list[str], meal_type: str = "both", area_hint: str = "") -> list[str]:
         prefix = f"{city_name}{area_hint}" if area_hint else city_name
-        base_keywords = [f"{prefix}餐厅", f"{prefix}美食", f"{prefix}本地菜", f"{prefix}小吃"]
-        taste_queries = [f"{prefix}{taste}味餐厅" for taste in tastes[:2]]
+        base_keywords = [f"{prefix}餐厅", f"{prefix}美食", f"{prefix}本地菜", f"{prefix}特色菜", f"{prefix}正餐"]
+        taste_queries: list[str] = []
+        for taste in tastes[:3]:
+            taste_queries.extend([f"{prefix}{taste}", f"{prefix}{taste}餐厅", f"{prefix}{taste}美食"])
+            if any(token in taste for token in ["日料", "日本", "寿司"]):
+                taste_queries.extend([f"{prefix}日料", f"{prefix}日本料理", f"{prefix}寿司"])
+            if "火锅" in taste:
+                taste_queries.extend([f"{prefix}火锅", f"{prefix}川味火锅"])
+            if any(token in taste for token in ["烧烤", "烤肉"]):
+                taste_queries.extend([f"{prefix}烧烤", f"{prefix}烤肉"])
+            if "海鲜" in taste:
+                taste_queries.extend([f"{prefix}海鲜", f"{prefix}海鲜餐厅"])
         if meal_type == "lunch":
-            meal_queries = [f"{prefix}面馆", f"{prefix}简餐", f"{prefix}小吃", f"{prefix}本地快餐"]
+            meal_queries = [f"{prefix}午餐", f"{prefix}面馆", f"{prefix}简餐", f"{prefix}本地快餐", f"{prefix}家常菜"]
         elif meal_type == "dinner":
-            meal_queries = [f"{prefix}本帮菜", f"{prefix}火锅", f"{prefix}烧烤", f"{prefix}酒楼", f"{prefix}夜宵"]
+            meal_queries = [f"{prefix}晚餐", f"{prefix}正餐", f"{prefix}本帮菜", f"{prefix}火锅", f"{prefix}烧烤", f"{prefix}酒楼", f"{prefix}私房菜", f"{prefix}特色餐厅"]
         else:
-            meal_queries = []
+            meal_queries = [f"{prefix}火锅", f"{prefix}烧烤", f"{prefix}酒楼", f"{prefix}地方菜"]
         deduped: list[str] = []
         seen: set[str] = set()
         for keyword in base_keywords + taste_queries + meal_queries:
@@ -692,20 +772,20 @@ class TencentMapSearchProvider:
         foods: list[FoodVenue] = []
         seen: set[str] = set()
         for index, item in enumerate(raw_items):
-            item = self._enrich_place_item(item)
             title = str(item.get("title") or item.get("name") or "").strip()
             address = str(item.get("address") or "").strip().lower()
             dedupe_key = f"{title.lower()}|{address}"
-            if not title or dedupe_key in seen:
+            if not title or dedupe_key in seen or not self._is_main_meal_place(title, meal_type):
                 continue
             seen.add(dedupe_key)
             lat, lon = self._item_latlon(item)
-            avg_cost = [42.0, 58.0, 86.0, 118.0][index % 4]
+            cuisine = self._infer_cuisine(title, tastes)
+            avg_cost = self._estimate_food_cost(title, cuisine, meal_type, index)
             foods.append(
                 FoodVenue(
                     name=title,
                     district=self._district_from_address(str(item.get("address", city_name)), city_name),
-                    cuisine=self._infer_cuisine(title, tastes),
+                    cuisine=cuisine,
                     description=str(item.get("detail_description") or item.get("address") or f"{city_name} 餐饮候选"),
                     average_cost=avg_cost,
                     tags=["food", source_tag, *tastes[:2]],
@@ -928,15 +1008,76 @@ class TencentMapSearchProvider:
         return mapping.get(category, ["09:30-11:00", "13:00-15:00", "15:30-17:30"][index % 3])
 
     def _infer_cuisine(self, title: str, tastes: list[str]) -> str:
+        if any(token in title for token in ["冰糖葫芦", "糖葫芦", "甜品", "蛋糕", "奶茶", "咖啡", "茶饮", "饮品"]):
+            return "甜品饮品"
+        if any(token in title for token in ["日料", "日本料理", "寿司", "刺身", "烧鸟"]):
+            return "日料"
+        if any(token in title for token in ["韩料", "韩国料理", "韩餐", "部队锅"]):
+            return "韩料"
+        if any(token in title for token in ["烧烤", "烤肉", "烤串"]):
+            return "烧烤"
+        if any(token in title for token in ["海鲜", "鱼", "虾", "蟹"]):
+            return "海鲜"
         if "面" in title:
             return "面食"
         if "火锅" in title:
             return "火锅"
         if "小吃" in title:
             return "地方小吃"
-        if tastes:
-            return f"{'、'.join(tastes[:2])}风味"
         return "地方风味"
+
+    def _is_main_meal_place(self, title: str, meal_type: str) -> bool:
+        light_tokens = [
+            "冰糖葫芦",
+            "糖葫芦",
+            "奶茶",
+            "茶饮",
+            "饮品",
+            "咖啡",
+            "甜品",
+            "蛋糕",
+            "面包",
+            "冰淇淋",
+            "果汁",
+            "零食",
+            "coco",
+            "都可",
+            "喜茶",
+            "奈雪",
+            "一点点",
+            "蜜雪冰城",
+            "茶百道",
+            "古茗",
+            "沪上阿姨",
+            "霸王茶姬",
+            "书亦烧仙草",
+            "瑞幸",
+            "星巴克",
+        ]
+        normalized = title.lower()
+        if any(token in normalized for token in light_tokens):
+            return False
+        if meal_type == "dinner" and any(token in title for token in ["小吃", "轻食", "茶铺", "快餐"]):
+            return False
+        return True
+
+    def _estimate_food_cost(self, title: str, cuisine: str, meal_type: str, index: int) -> float:
+        text = f"{title} {cuisine}"
+        if any(token in text for token in ["甜品", "饮品", "奶茶", "咖啡", "糖葫芦"]):
+            base = 24.0
+        elif any(token in text for token in ["火锅", "烧烤", "烤肉", "海鲜", "酒楼", "私房"]):
+            base = 118.0
+        elif any(token in text for token in ["日料", "日本料理", "寿司", "韩料"]):
+            base = 108.0
+        elif any(token in text for token in ["面", "粉", "快餐", "简餐"]):
+            base = 46.0
+        else:
+            base = 76.0
+        if meal_type == "dinner":
+            base *= 1.18
+        elif meal_type == "lunch":
+            base *= 0.92
+        return round(base + (index % 4) * 8.0, 2)
 
     def _hotel_tags_from_price(self, price: float) -> list[str]:
         if price <= 240:

@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 from ..models import HotelVenue, PointOfInterest, TripRequest
+
+
+@dataclass
+class HotelScoringPolicy:
+    transit_first: bool = False
+    scenic_first: bool = False
+    nightlife_first: bool = False
+    quiet_first: bool = False
+    value_first: bool = False
+    hotel_budget_override: str | None = None
 
 
 class HotelAgent:
@@ -12,29 +23,36 @@ class HotelAgent:
         daily_spot_plans: list[dict],
         hotel_options: list[HotelVenue],
         llm_provider: object | None = None,
+        policy: HotelScoringPolicy | None = None,
     ) -> tuple[list[dict], list[str]]:
         notes: list[str] = []
         all_candidates = list(hotel_options)
         candidates = list(all_candidates)
-        if request.must_have_hotel_area:
-            required_area = request.must_have_hotel_area.strip()
+        effective_policy = policy or HotelScoringPolicy()
+
+        runtime_request = request
+        if effective_policy.hotel_budget_override:
+            runtime_request = _with_hotel_budget(request, effective_policy.hotel_budget_override)
+
+        if runtime_request.must_have_hotel_area:
+            required_area = runtime_request.must_have_hotel_area.strip()
             candidates = [hotel for hotel in candidates if self._hotel_matches_area(hotel, required_area)]
             if not candidates:
                 candidates = list(all_candidates)
-                notes.append(f"酒店偏好区域“{required_area}”未命中，已降级为全量候选继续规划。")
+                notes.append(f"Hotel area preference \"{required_area}\" not matched, using all candidates.")
             else:
-                notes.append(f"酒店已优先匹配偏好区域：{required_area}（命中 {len(candidates)} 家）。")
+                notes.append(f"Hotel area matched: {required_area} ({len(candidates)} options).")
 
         for plan in daily_spot_plans:
             spots: list[PointOfInterest] = plan["spots"]
             if not candidates:
                 plan["hotel"] = None
-                notes.append(f"第 {plan['day']} 天未获得酒店候选。")
+                notes.append(f"Day {plan['day']}: no hotel candidates.")
                 continue
-            selected = self._select_hotel(request, spots, candidates, llm_provider)
+            selected = self._select_hotel(runtime_request, spots, candidates, llm_provider, effective_policy)
             plan["hotel"] = selected
         if candidates:
-            notes.append("Hotel Agent 已根据预算、区域与点位距离完成酒店分配。")
+            notes.append("Hotel Agent completed budget/area/distance scoring.")
         return daily_spot_plans, notes
 
     def _select_hotel(
@@ -43,7 +61,9 @@ class HotelAgent:
         spots: list[PointOfInterest],
         hotel_options: list[HotelVenue],
         llm_provider: object | None = None,
+        policy: HotelScoringPolicy | None = None,
     ) -> HotelVenue:
+        effective_policy = policy or HotelScoringPolicy()
         if llm_provider and hasattr(llm_provider, "select_hotel"):
             selected = llm_provider.select_hotel(request, hotel_options, spots)
             if isinstance(selected, dict):
@@ -51,18 +71,37 @@ class HotelAgent:
                 for hotel in hotel_options:
                     if hotel.name.lower() == selected_name:
                         return hotel
-        ranked = sorted(hotel_options, key=lambda hotel: self._hotel_score(request, spots, hotel), reverse=True)
+        ranked = sorted(hotel_options, key=lambda hotel: self._hotel_score(request, spots, hotel, effective_policy), reverse=True)
         return ranked[0]
 
-    def _hotel_score(self, request: TripRequest, spots: list[PointOfInterest], hotel: HotelVenue) -> tuple[float, float]:
+    def _hotel_score(self, request: TripRequest, spots: list[PointOfInterest], hotel: HotelVenue, policy: HotelScoringPolicy | None = None) -> tuple[float, float]:
+        effective_policy = policy or HotelScoringPolicy()
         avg_lat = sum(spot.lat for spot in spots) / max(len(spots), 1)
         avg_lon = sum(spot.lon for spot in spots) / max(len(spots), 1)
         distance_penalty = self._haversine(avg_lat, avg_lon, hotel.lat, hotel.lon)
         area_bonus = 2.0 if request.must_have_hotel_area and self._hotel_matches_area(hotel, request.must_have_hotel_area) else 0.0
         budget_bonus = self._budget_fit_bonus(request.hotel_budget_preference, hotel.price_per_night)
-        hotel_text = f"{hotel.district} {hotel.address} {hotel.name}"
-        tag_bonus = 1.0 if request.preferred_areas and any(area and area in hotel_text for area in request.preferred_areas) else 0.0
-        return (budget_bonus + area_bonus + tag_bonus - distance_penalty, -hotel.price_per_night)
+        hotel_text = f"{hotel.district} {hotel.address} {hotel.name}".lower()
+        tag_bonus = 1.0 if request.preferred_areas and any(area and area.lower() in hotel_text for area in request.preferred_areas) else 0.0
+
+        policy_bonus = 0.0
+        if effective_policy.transit_first:
+            if any(kw in hotel_text for kw in ["地铁", "站", "station", "交通", "Metro", "rail"]):
+                policy_bonus += 1.5
+        if effective_policy.scenic_first:
+            if any(kw in hotel_text for kw in ["景区", "公园", "山", "湖", "海", "风景", "scenic"]):
+                policy_bonus += 1.5
+        if effective_policy.nightlife_first:
+            if any(kw in hotel_text for kw in ["酒吧", "夜", "娱乐", "夜生活", "nightlife", "bar"]):
+                policy_bonus += 1.5
+        if effective_policy.quiet_first:
+            if not any(kw in hotel_text for kw in ["酒吧", "KTV", "夜总会", "夜店", "娱乐"]):
+                policy_bonus += 1.0
+        if effective_policy.value_first:
+            if 150 <= hotel.price_per_night <= 450:
+                policy_bonus += 1.0
+
+        return (budget_bonus + area_bonus + tag_bonus + policy_bonus - distance_penalty, -hotel.price_per_night)
 
     def _hotel_matches_area(self, hotel: HotelVenue, area: str) -> bool:
         target = area.strip().lower()
@@ -87,3 +126,10 @@ class HotelAgent:
             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
         )
         return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _with_hotel_budget(request: TripRequest, budget_preference: str) -> TripRequest:
+    import copy
+    result = copy.copy(request)
+    result.hotel_budget_preference = budget_preference  # type: ignore[assignment]
+    return result

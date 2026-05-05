@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass, field
 import math
 import re
 
 from ..models import PointOfInterest, TravelConstraints, TripRequest, ValidationIssue
+
+
+@dataclass
+class PersonalizationPolicy:
+    """Policy to guide PlannerAgent behavior. All fields optional — None means use default."""
+
+    max_spots_per_day: int | None = None
+    earliest_start_minute: int | None = None  # e.g. 540 = 9:00 AM
+    prefer_evening_spots: bool = False
+    cross_district_penalty: float | None = None  # None = use default (1.2)
+    nightlife_bonus: float = 0.0
+    photogenic_bonus: float = 0.0
+    youth_timing: bool = False  # if True, prefer later starts and relaxed pacing
+
+    def effective_penalty(self) -> float:
+        """Return the cross-district penalty to use in bucket cost."""
+        return self.cross_district_penalty if self.cross_district_penalty is not None else 1.2
 
 
 class PlannerAgent:
@@ -14,16 +32,18 @@ class PlannerAgent:
         ranked_pois: list[PointOfInterest],
         constraints: TravelConstraints,
         llm_provider: object | None = None,
+        policy: PersonalizationPolicy | None = None,
     ) -> tuple[list[dict], str]:
+        effective_policy = policy or PersonalizationPolicy()
         if llm_provider and hasattr(llm_provider, "draft_itinerary"):
             generated = llm_provider.draft_itinerary(request, ranked_pois, constraints)
             normalized = self._normalize_llm_plan(generated, ranked_pois)
             if normalized:
                 enforced = self._enforce_required_spots(normalized, ranked_pois, request, constraints)
-                return self._ensure_daily_density(enforced, ranked_pois, request, constraints), "百炼生成初版多日路线（含必达约束）"
-        heuristic = self._heuristic_daily_spot_plan(request, ranked_pois, constraints)
+                return self._ensure_daily_density(enforced, ranked_pois, request, constraints, effective_policy), "百炼生成初版多日路线（含必达约束）"
+        heuristic = self._heuristic_daily_spot_plan(request, ranked_pois, constraints, effective_policy)
         enforced = self._enforce_required_spots(heuristic, ranked_pois, request, constraints)
-        return self._ensure_daily_density(enforced, ranked_pois, request, constraints), "本地规则生成初版多日路线（含必达约束）"
+        return self._ensure_daily_density(enforced, ranked_pois, request, constraints, effective_policy), "本地规则生成初版多日路线（含必达约束）"
 
     def revise_daily_spot_plan(
         self,
@@ -33,30 +53,35 @@ class PlannerAgent:
         draft_plan: list[dict],
         issues: list[ValidationIssue],
         llm_provider: object | None = None,
+        policy: PersonalizationPolicy | None = None,
     ) -> tuple[list[dict], str]:
+        effective_policy = policy or PersonalizationPolicy()
         if llm_provider and hasattr(llm_provider, "revise_itinerary"):
             revised = llm_provider.revise_itinerary(draft_plan, issues, ranked_pois)
             normalized = self._normalize_llm_plan(revised, ranked_pois)
             if normalized:
                 enforced = self._enforce_required_spots(normalized, ranked_pois, request, constraints)
-                return self._ensure_daily_density(enforced, ranked_pois, request, constraints), "百炼根据校验结果完成路线修正（含必达约束）"
+                return self._ensure_daily_density(enforced, ranked_pois, request, constraints, effective_policy), "百炼根据校验结果完成路线修正（含必达约束）"
         revised = self._heuristic_revision(request, ranked_pois, constraints)
         enforced = self._enforce_required_spots(revised, ranked_pois, request, constraints)
-        return self._ensure_daily_density(enforced, ranked_pois, request, constraints), "本地规则完成路线修正（含必达约束）"
+        return self._ensure_daily_density(enforced, ranked_pois, request, constraints, effective_policy), "本地规则完成路线修正（含必达约束）"
 
     def _heuristic_daily_spot_plan(
         self,
         request: TripRequest,
         ranked_pois: list[PointOfInterest],
         constraints: TravelConstraints,
+        policy: PersonalizationPolicy | None = None,
     ) -> list[dict]:
-        base_slots_per_day = {"relaxed": 2, "balanced": 3, "dense": 4}[request.style]
+        effective_policy = policy or PersonalizationPolicy()
+        base_override = effective_policy.max_spots_per_day
+        base_slots_per_day = base_override if base_override is not None else {"relaxed": 2, "balanced": 3, "dense": 4}[request.style]
         selected_count = min(len(ranked_pois), max(request.days * (base_slots_per_day + 1), request.days))
         selected = ranked_pois[:selected_count]
         if not selected:
             return []
         effective_slots_per_day = max(1, min(base_slots_per_day, math.ceil(len(selected) / max(request.days, 1))))
-        day_buckets = self._cluster_day_buckets(selected, request.days, effective_slots_per_day)
+        day_buckets = self._cluster_day_buckets(selected, request.days, effective_slots_per_day, effective_policy)
 
         daily_plans: list[dict] = []
         for day, bucket in enumerate(day_buckets, start=1):
@@ -145,10 +170,13 @@ class PlannerAgent:
         ranked_pois: list[PointOfInterest],
         request: TripRequest,
         constraints: TravelConstraints,
+        policy: PersonalizationPolicy | None = None,
     ) -> list[dict]:
         if not daily_plans:
             return daily_plans
-        target_per_day = {"relaxed": 2, "balanced": 3, "dense": 4}[request.style]
+        effective_policy = policy or PersonalizationPolicy()
+        override = effective_policy.max_spots_per_day
+        target_per_day = override if override is not None else {"relaxed": 2, "balanced": 3, "dense": 4}[request.style]
         if target_per_day <= 1:
             return daily_plans
         used = {spot.name.lower() for plan in daily_plans for spot in plan["spots"]}
@@ -315,6 +343,7 @@ class PlannerAgent:
         pois: list[PointOfInterest],
         days: int,
         target_per_day: int,
+        policy: PersonalizationPolicy | None = None,
     ) -> list[list[PointOfInterest]]:
         anchor_count = min(days, len(pois))
         anchors = self._choose_day_anchors(pois, anchor_count)
@@ -323,7 +352,7 @@ class PlannerAgent:
         capacities = [target_per_day for _ in range(anchor_count)]
 
         for poi in remaining:
-            bucket_index = self._best_bucket_for_poi(poi, buckets, capacities)
+            bucket_index = self._best_bucket_for_poi(poi, buckets, capacities, policy)
             buckets[bucket_index].append(poi)
 
         ordered_buckets = [self._order_bucket(bucket) for bucket in buckets]
@@ -353,13 +382,14 @@ class PlannerAgent:
         poi: PointOfInterest,
         buckets: list[list[PointOfInterest]],
         capacities: list[int],
+        policy: PersonalizationPolicy | None = None,
     ) -> int:
         candidate_indexes = [index for index, bucket in enumerate(buckets) if len(bucket) < capacities[index]]
         if not candidate_indexes:
             candidate_indexes = list(range(len(buckets)))
         return min(
             candidate_indexes,
-            key=lambda index: self._bucket_cost(poi, buckets[index], capacities[index]),
+            key=lambda index: self._bucket_cost(poi, buckets[index], capacities[index], policy),
         )
 
     def _bucket_cost(
@@ -367,10 +397,12 @@ class PlannerAgent:
         poi: PointOfInterest,
         bucket: list[PointOfInterest],
         capacity: int,
+        policy: PersonalizationPolicy | None = None,
     ) -> tuple[float, float, float]:
+        effective_policy = policy or PersonalizationPolicy()
         center = self._cluster_center(bucket)
         distance = self._distance(center, poi)
-        district_penalty = 0.0 if poi.district in {item.district for item in bucket} else 1.2
+        district_penalty = effective_policy.effective_penalty() if poi.district not in {item.district for item in bucket} else 0.0
         long_trip_penalty = 0.0
         if distance > 25.0:
             long_trip_penalty = 14.0
@@ -379,7 +411,14 @@ class PlannerAgent:
         elif distance > 8.0:
             long_trip_penalty = 2.5
         fullness_penalty = max(0, len(bucket) - capacity + 1) * 0.8
-        return (distance + district_penalty + long_trip_penalty + fullness_penalty, distance, poi.ticket_cost)
+        # Nightlife and photogenic bonuses for evening-oriented POIs
+        tag_text = " ".join(poi.tags).lower() if poi.tags else ""
+        bonus = 0.0
+        if effective_policy.nightlife_bonus and any(w in tag_text for w in ["夜", "夜游", "酒吧", "夜景", "灯光"]):
+            bonus += effective_policy.nightlife_bonus
+        if effective_policy.photogenic_bonus and any(w in tag_text for w in ["拍照", "出片", "网红", "美"]):
+            bonus += effective_policy.photogenic_bonus
+        return (distance + district_penalty + long_trip_penalty + fullness_penalty - bonus, distance, poi.ticket_cost)
 
     def _order_bucket(self, bucket: list[PointOfInterest]) -> list[PointOfInterest]:
         if len(bucket) <= 2:

@@ -13,8 +13,12 @@ import type {
 } from "../types/api";
 import { fetchRoutePlan } from "../api/client";
 import {
+  formatDistanceKm,
+  formatDurationMinutes,
+  translateAgentStatus,
   translateNoteStyle,
   translateEvidenceType,
+  translateRouteStatus,
 } from "../utils/translations";
 import TripMapView, { type TripMapHandle } from "./TripMapView";
 
@@ -55,7 +59,22 @@ function summarizeSegment(segment?: TransportSegment | null): string {
       bus: "公交",
       walk: "步行",
     }[segment.segment_type] || segment.segment_type;
-  return `${mode} · ${segment.from_label} → ${segment.to_label} · ${segment.duration_minutes} 分钟 · ¥${segment.estimated_cost.toFixed(0)}`;
+  return `${mode} · ${segment.from_label} → ${segment.to_label} · ${segment.duration_minutes} 分钟 · ${segment.estimated_cost.toFixed(0)} 元`;
+}
+
+function transportTypeLabel(type: string): string {
+  const labels: Record<string, string> = {
+    intercity: "高铁/飞机/城际",
+    taxi: "打车",
+    metro: "地铁",
+    bus: "公交",
+    walk: "步行",
+    driving: "自驾/观光车",
+    walking: "步行",
+    bicycling: "骑行",
+    transit: "公共交通",
+  };
+  return labels[type] ?? type;
 }
 
 function summarizeStepTransport(step: AnimationStep) {
@@ -65,14 +84,14 @@ function summarizeStepTransport(step: AnimationStep) {
 
   const detailParts = [
     `约 ${step.next_transport_duration ?? 0} 分钟`,
-    `¥${(step.next_transport_cost ?? 0).toFixed(0)}`,
+    `${(step.next_transport_cost ?? 0).toFixed(0)} 元`,
   ];
 
   if (typeof step.next_transport_distance_km === "number") {
-    detailParts.push(`${step.next_transport_distance_km.toFixed(1)} km`);
+    detailParts.push(formatDistanceKm(step.next_transport_distance_km));
   }
 
-  return `${step.next_transport_type} · ${detailParts.join(" · ")}`;
+  return `${transportTypeLabel(step.next_transport_type)} · ${detailParts.join(" · ")}`;
 }
 
 function transportModeLabel(mode: RouteTransportMode): string {
@@ -279,11 +298,11 @@ export default function ResultView({ result }: Props) {
       if (leg && Array.isArray(leg.path) && leg.path.length >= 2) {
         const duration = Math.max(0, Number(leg.duration_minutes || 0));
         const distance = Math.max(0, Number(leg.distance_km || 0));
-        const summary = `${routeModeDisplay} · ${duration} min · ${distance.toFixed(1)} km`;
+        const summary = `${routeModeDisplay} · ${formatDurationMinutes(duration)} · ${formatDistanceKm(distance)}`;
         const detail = leg.warning?.trim()
           ? leg.warning.trim()
           : leg.status && leg.status !== "ok"
-            ? `Route status: ${leg.status}`
+            ? `路线状态：${translateRouteStatus(leg.status)}`
             : "";
         return {
           summary,
@@ -589,7 +608,7 @@ export default function ResultView({ result }: Props) {
                 {plan.days.length} 天
               </span>
               <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-medium text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
-                预算 ¥{plan.request.budget.toFixed(0)}
+                预算 {plan.request.budget.toFixed(0)} 元
               </span>
             </div>
           </div>
@@ -618,7 +637,7 @@ export default function ResultView({ result }: Props) {
                 <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
                   <div className="text-xs text-slate-500">预计花费</div>
                   <div className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">
-                    ¥{plan.budget_summary.total_estimated.toFixed(0)}
+                    {plan.budget_summary.total_estimated.toFixed(0)} 元
                   </div>
                 </div>
                 <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
@@ -630,7 +649,7 @@ export default function ResultView({ result }: Props) {
                         : "text-red-600"
                     }`}
                   >
-                    ¥{plan.budget_summary.remaining_budget.toFixed(0)}
+                    {plan.budget_summary.remaining_budget.toFixed(0)} 元
                   </div>
                 </div>
                 <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
@@ -731,7 +750,7 @@ export default function ResultView({ result }: Props) {
                       const total = arrivalCost + departureCost;
                       return total > 0 ? (
                         <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
-                          合计 ¥{total.toFixed(0)}
+                          合计 {total.toFixed(0)} 元
                         </span>
                       ) : null;
                     })()}
@@ -761,7 +780,7 @@ export default function ResultView({ result }: Props) {
                           </span>
                           {segment?.estimated_cost ? (
                             <span className="ml-auto text-xs font-medium text-indigo-600 dark:text-indigo-400">
-                              ¥{segment.estimated_cost.toFixed(0)}
+                              {segment.estimated_cost.toFixed(0)} 元
                             </span>
                           ) : null}
                         </div>
@@ -825,7 +844,7 @@ export default function ResultView({ result }: Props) {
                                 {line.category}
                               </span>
                               <span className="text-slate-600 dark:text-slate-300">
-                                ¥{line.amount.toFixed(0)}
+                                {line.amount.toFixed(0)} 元
                               </span>
                             </div>
                             <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-700">
@@ -947,7 +966,7 @@ export default function ResultView({ result }: Props) {
                     : routeError
                       ? `路线规划失败：${routeError}`
                       : routePlan
-                        ? `导航模式：${routeModeDisplay} · 状态：${routePlan.status}${
+                        ? `导航模式：${routeModeDisplay} · 状态：${translateRouteStatus(routePlan.status)}${
                             routeWarningsText ? ` · ${routeWarningsText}` : ""
                           }`
                         : "未返回可用导航路线，将使用已有路径信息。"}
@@ -1212,12 +1231,12 @@ export default function ResultView({ result }: Props) {
 
               <section className="flex h-[72vh] flex-col rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
                 <h3 className="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
-                  Agent 轨迹
+                  智能体轨迹
                 </h3>
                 <div className="flex-1 space-y-2 overflow-y-auto pr-1">
                   {(plan.trace || []).length === 0 && (
                     <div className="rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-500 dark:border-slate-600 dark:text-slate-400">
-                      当前案例没有 Agent 轨迹。
+                      当前案例没有智能体轨迹。
                     </div>
                   )}
                   {traceRows.map((step: AgentTraceStep, idx: number) => (
@@ -1230,7 +1249,7 @@ export default function ResultView({ result }: Props) {
                           {step.agent_name}
                         </div>
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                          {step.status || "ok"}
+                          {translateAgentStatus(step.status)}
                         </span>
                       </div>
                       <div className="mt-1 text-xs text-slate-500">
@@ -1258,7 +1277,7 @@ export default function ResultView({ result }: Props) {
                   导出中心
                 </div>
                 <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                  一键下载结构化数据与旅行手册，下方可直接查看 Markdown。
+                  一键下载结构化数据与旅行手册，下方可直接查看文档预览。
                 </div>
               </div>
 
@@ -1274,7 +1293,7 @@ export default function ResultView({ result }: Props) {
                     }
                     className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-white px-4 py-3 text-sm font-medium text-indigo-700 transition hover:border-indigo-400 hover:bg-indigo-50 dark:border-indigo-700 dark:bg-slate-900 dark:text-indigo-300"
                   >
-                    <FileDown className="h-4 w-4" /> 下载计划 JSON
+                    <FileDown className="h-4 w-4" /> 下载计划数据（JSON）
                   </button>
                 </div>
                 <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-700 dark:bg-slate-900/40">
@@ -1288,7 +1307,7 @@ export default function ResultView({ result }: Props) {
                     }
                     className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-sky-200 bg-white px-4 py-3 text-sm font-medium text-sky-700 transition hover:border-sky-400 hover:bg-sky-50 dark:border-sky-700 dark:bg-slate-900 dark:text-sky-300"
                   >
-                    <FileDown className="h-4 w-4" /> 下载动画 JSON
+                    <FileDown className="h-4 w-4" /> 下载动画数据（JSON）
                   </button>
                 </div>
                 <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-700 dark:bg-slate-900/40">
@@ -1310,7 +1329,7 @@ export default function ResultView({ result }: Props) {
 
               <div className="rounded-2xl border border-slate-200 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
                 <div className="mb-2 text-sm font-medium text-slate-700 dark:text-slate-200">
-                  Markdown 预览
+                  旅行手册预览
                 </div>
                 <pre className="max-h-[56vh] overflow-auto rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap text-xs leading-5 text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
                   {plan.summary_markdown || "当前案例未提供 markdown 摘要。"}

@@ -21,10 +21,12 @@ class FoodSpotAgent:
         for index, plan in enumerate(daily_spot_plans, start=1):
             day_index = int(plan.get("day", index))
             meal_paths = plan.get("meal_paths", {})
+            day_notes = []
+
             lunch_candidates = meal_jobs[job_cursor]["candidates"] if job_cursor < len(meal_jobs) else fallback_foods
             lunch_anchor = self._meal_anchor(plan["spots"], "lunch")
-            dinner_anchor = self._meal_anchor(plan["spots"], "dinner")
             day_used_keys: set[str] = set()
+
             lunch_allow_repeat, lunch_available, lunch_remaining = self._repeat_policy(meal_jobs, job_cursor, used_keys, day_used_keys)
             lunch, lunch_key = self._pick_food(
                 "lunch",
@@ -39,8 +41,20 @@ class FoodSpotAgent:
             )
             used_keys.add(lunch_key)
             day_used_keys.add(lunch_key)
+            if lunch_allow_repeat:
+                day_notes.append(f"午餐候选覆盖度不足：剩余 {lunch_remaining} 餐仅有 {lunch_available} 个未复用候选。")
+            if lunch and lunch.fallback_used:
+                day_notes.append(f"午餐候选不足，已允许回退使用重复餐饮：{lunch.venue_name}。")
+            if lunch:
+                day_notes.append(f"午餐使用 {self._selection_tier_text(lunch.selection_tier)}候选，主来源：{self._primary_source(lunch_candidates)}。")
+            if lunch and lunch.route_distance_km > 1.0:
+                day_notes.append(f"午餐 {lunch.venue_name} 距离午餐主路线约 {lunch.route_distance_km:.1f} km，因近距离候选不足已放宽搜索半径。")
+
             job_cursor += 1
+
             dinner_candidates = meal_jobs[job_cursor]["candidates"] if job_cursor < len(meal_jobs) else fallback_foods
+            dinner_anchor = self._meal_anchor(plan["spots"], "dinner")
+
             dinner_allow_repeat, dinner_available, dinner_remaining = self._repeat_policy(meal_jobs, job_cursor, used_keys, day_used_keys)
             dinner, dinner_key = self._pick_food(
                 "dinner",
@@ -55,25 +69,21 @@ class FoodSpotAgent:
             )
             used_keys.add(dinner_key)
             day_used_keys.add(dinner_key)
+            if dinner_allow_repeat:
+                day_notes.append(f"晚餐候选覆盖度不足：剩余 {dinner_remaining} 餐仅有 {dinner_available} 个未复用候选。")
+            if dinner and dinner.fallback_used:
+                day_notes.append(f"晚餐候选不足，已允许回退使用重复餐饮：{dinner.venue_name}。")
+            if dinner:
+                day_notes.append(f"晚餐使用 {self._selection_tier_text(dinner.selection_tier)}候选，主来源：{self._primary_source(dinner_candidates)}。")
+            if dinner and dinner.route_distance_km > 1.5:
+                day_notes.append(f"晚餐 {dinner.venue_name} 距离晚餐主路线约 {dinner.route_distance_km:.1f} km，因近距离候选不足已放宽搜索半径。")
+
             job_cursor += 1
             notes = plan.setdefault("notes", [])
+            notes[:0] = day_notes
             notes.append(self._pool_note("午餐", lunch_candidates))
             notes.append(self._pool_note("晚餐", dinner_candidates))
-            if lunch_allow_repeat:
-                notes.append(f"午餐候选覆盖度不足：剩余 {lunch_remaining} 餐仅有 {lunch_available} 个未复用候选。")
-            if dinner_allow_repeat:
-                notes.append(f"晚餐候选覆盖度不足：剩余 {dinner_remaining} 餐仅有 {dinner_available} 个未复用候选。")
-            if lunch.fallback_used:
-                notes.append(f"午餐候选不足，已允许回退使用重复餐饮：{lunch.venue_name}。")
-            if dinner.fallback_used:
-                notes.append(f"晚餐候选不足，已允许回退使用重复餐饮：{dinner.venue_name}。")
-            notes.append(f"午餐使用 {self._selection_tier_text(lunch.selection_tier)}候选，主来源：{self._primary_source(lunch_candidates)}。")
-            notes.append(f"晚餐使用 {self._selection_tier_text(dinner.selection_tier)}候选，主来源：{self._primary_source(dinner_candidates)}。")
-            if lunch.route_distance_km > 1.0:
-                notes.append(f"午餐 {lunch.venue_name} 距离午餐主路线约 {lunch.route_distance_km:.1f} km，因近距离候选不足已放宽搜索半径。")
-            if dinner.route_distance_km > 1.5:
-                notes.append(f"晚餐 {dinner.venue_name} 距离晚餐主路线约 {dinner.route_distance_km:.1f} km，因近距离候选不足已放宽搜索半径。")
-            plan["meals"] = [lunch, dinner]
+            plan["meals"] = [] if lunch is None and dinner is None else [m for m in [lunch, dinner] if m is not None]
         return daily_spot_plans
 
     def _pick_food(
@@ -92,6 +102,11 @@ class FoodSpotAgent:
             (food, self._route_distance(food, route_path), self._anchor_distance(food, anchor))
             for food in candidates
         ]
+        main_meal_candidates = [
+            item for item in candidates_with_distance if self._is_main_meal_candidate(item[0], meal_type)
+        ]
+        if main_meal_candidates:
+            candidates_with_distance = main_meal_candidates
         if not candidates_with_distance:
             fallback_food = self._build_fallback_food(meal_type, day_index)
             estimated_cost = self._cost_for_meal(fallback_food, meal_type, day_index)
@@ -288,7 +303,7 @@ class FoodSpotAgent:
         day_adjust = self._day_variation(day_index)
         deterministic_bias = self._name_bias(food.name)
         estimated = base * meal_factor * district_factor * venue_factor * budget_factor + day_adjust + deterministic_bias
-        floor = 22.0 if meal_type == "lunch" else 48.0
+        floor = 32.0 if meal_type == "lunch" else 68.0
         return round(max(floor, estimated), 2)
 
     def _build_reason(
@@ -315,6 +330,8 @@ class FoodSpotAgent:
 
     def _venue_factor(self, food: FoodVenue) -> float:
         text = f"{food.name} {food.cuisine} {food.description}"
+        if self._is_light_snack_text(text):
+            return 0.45
         if any(token in text for token in ["小吃", "面", "粉", "快餐", "盖饭", "茶铺"]):
             return 0.82
         if any(token in text for token in ["本帮", "私房", "烤肉", "火锅", "海鲜", "夜宵", "酒楼"]):
@@ -322,6 +339,47 @@ class FoodSpotAgent:
         if any(token in text for token in ["咖啡", "甜品", "轻食", "茶餐厅"]):
             return 0.96
         return 1.0
+
+    def _is_main_meal_candidate(self, food: FoodVenue, meal_type: str) -> bool:
+        text = f"{food.name} {food.cuisine} {food.description} {' '.join(food.tags)}"
+        if self._is_light_snack_text(text):
+            return False
+        if meal_type == "dinner" and any(token in text for token in ["小吃", "轻食", "茶铺", "快餐", "饮品", "咖啡", "甜品"]):
+            return False
+        return True
+
+    def _is_light_snack_text(self, text: str) -> bool:
+        normalized = text.lower()
+        return any(
+            token in normalized
+            for token in [
+                "冰糖葫芦",
+                "糖葫芦",
+                "奶茶",
+                "茶饮",
+                "饮品",
+                "咖啡",
+                "甜品",
+                "蛋糕",
+                "面包",
+                "冰淇淋",
+                "果汁",
+                "零食",
+                "coco",
+                "都可",
+                "喜茶",
+                "奈雪",
+                "一点点",
+                "蜜雪冰城",
+                "茶百道",
+                "古茗",
+                "沪上阿姨",
+                "霸王茶姬",
+                "书亦烧仙草",
+                "瑞幸",
+                "星巴克",
+            ]
+        )
 
     def _budget_factor(self, meal_type: str) -> float:
         budget_mode = getattr(self, "_active_budget_mode", "balanced")

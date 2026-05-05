@@ -235,8 +235,41 @@ class TransportAgent:
     def _select_option(self, options: list[IntercityOption]) -> IntercityOption | None:
         if not options:
             return None
-        ranked = sorted(options, key=lambda item: (item.duration_minutes, item.price_cny, item.depart_time))
+        ranked = sorted(
+            options,
+            key=lambda item: (
+                self._departure_penalty(item.depart_time),
+                item.duration_minutes,
+                item.price_cny,
+                item.depart_time,
+            ),
+        )
         return ranked[0]
+
+    def _departure_penalty(self, depart_time: str) -> int:
+        minutes = self._time_to_minutes(depart_time)
+        if minutes is None:
+            return 0
+        if minutes < 6 * 60:
+            return 240
+        if minutes < 7 * 60:
+            return 120
+        if minutes < 8 * 60:
+            return 45
+        if minutes < 8 * 60 + 30:
+            return 15
+        if minutes >= 23 * 60:
+            return 90
+        if minutes >= 21 * 60 + 30:
+            return 30
+        return 0
+
+    def _time_to_minutes(self, value: str) -> int | None:
+        try:
+            hour_text, minute_text = value.split(":", 1)
+            return int(hour_text) * 60 + int(minute_text)
+        except Exception:
+            return None
 
     def _departure_date(self, request: TripRequest) -> str:
         if request.departure_date:

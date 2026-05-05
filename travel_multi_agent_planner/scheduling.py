@@ -5,6 +5,8 @@ from typing import Any
 
 DEFAULT_DAY_START_MINUTES = 9 * 60
 DEFAULT_DAY_END_MINUTES = 20 * 60 + 30
+YOUTH_DAY_START_MINUTES = 9 * 60  # Non-necessary departure not before 9:00
+YOUTH_DAY_END_MINUTES = 22 * 60  # Youth-friendly night end time (22:00 instead of 20:30)
 LUNCH_START_MINUTES = 11 * 60 + 30
 LUNCH_START_MAX_MINUTES = 13 * 60 + 30
 DINNER_START_MINUTES = 17 * 60
@@ -13,6 +15,7 @@ HOTEL_ANCHOR_MINUTES = 5
 INTERCITY_ARRIVAL_BUFFER_MINUTES = 75
 INTERCITY_DEPARTURE_BUFFER_MINUTES = 90
 ROUGH_TRANSFER_BUFFER_MINUTES = 12
+NOON_REST_BUFFER_MINUTES = 30  # 30-minute rest window around noon
 
 
 def parse_clock(value: str) -> int | None:
@@ -30,7 +33,9 @@ def parse_clock(value: str) -> int | None:
 
 
 def format_minutes(total_minutes: int) -> str:
-    normalized = max(0, total_minutes)
+    # Use modulo 24 hours to wrap times exceeding 24 hours
+    # e.g., 1527 minutes (25h 27m) becomes 87 minutes (01:27)
+    normalized = max(0, total_minutes) % (24 * 60)
     return f"{normalized // 60:02d}:{normalized % 60:02d}"
 
 
@@ -42,17 +47,19 @@ def segment_departure_minutes(segment: Any) -> int | None:
     return parse_clock(getattr(segment, "depart_time", ""))
 
 
-def day_start_minutes(day: Any) -> int:
+def day_start_minutes(day: Any, youth_timing: bool = False) -> int:
     arrival_minutes = segment_arrival_minutes(getattr(day, "arrival_segment", None))
+    base = YOUTH_DAY_START_MINUTES if youth_timing else DEFAULT_DAY_START_MINUTES
     if arrival_minutes is None:
-        return DEFAULT_DAY_START_MINUTES
-    return max(DEFAULT_DAY_START_MINUTES, arrival_minutes + INTERCITY_ARRIVAL_BUFFER_MINUTES)
+        return base
+    return max(base, arrival_minutes + INTERCITY_ARRIVAL_BUFFER_MINUTES)
 
 
-def day_end_minutes(day: Any) -> int:
+def day_end_minutes(day: Any, youth_timing: bool = False) -> int:
     departure_minutes = segment_departure_minutes(getattr(day, "departure_segment", None))
+    base = YOUTH_DAY_END_MINUTES if youth_timing else DEFAULT_DAY_END_MINUTES
     if departure_minutes is None:
-        return DEFAULT_DAY_END_MINUTES
+        return base
     return max(DEFAULT_DAY_START_MINUTES + 120, departure_minutes - INTERCITY_DEPARTURE_BUFFER_MINUTES)
 
 
@@ -71,6 +78,22 @@ def spot_time_bucket(spot: Any) -> str:
     if start_minutes < 20 * 60:
         return "evening"
     return "night"
+
+
+def spot_opening_window_ok(spot: Any, start_minutes: int, duration_minutes: int) -> bool:
+    window = str(getattr(spot, "opening_hours", "") or "").strip()
+    if not window or "-" not in window:
+        return True  # No data, default allow
+    parts = window.split("-", 1)
+    if len(parts) != 2:
+        return True
+    open_min = parse_clock(parts[0])
+    close_min = parse_clock(parts[1])
+    if open_min is None or close_min is None:
+        return True
+    end_minutes = start_minutes + duration_minutes
+    # Allow if the entire visit falls within opening window (with 30-min buffer before close)
+    return open_min <= start_minutes and end_minutes <= max(close_min, open_min + 30)
 
 
 def node_duration_minutes(node: dict) -> int:
@@ -157,6 +180,7 @@ def build_day_timeline(day: Any) -> list[dict]:
                     "address": spot.address or spot.description,
                     "district": spot.district,
                     "duration_hint_minutes": round(spot.duration_hours * 60),
+                    "_spot": spot,
                 }
             )
             spot_order += 1
@@ -180,13 +204,13 @@ def build_day_timeline(day: Any) -> list[dict]:
     return [node for node in timeline if node["lat"] and node["lon"]]
 
 
-def build_scheduled_day_timeline(day: Any) -> list[dict]:
+def build_scheduled_day_timeline(day: Any, youth_timing: bool = False) -> list[dict]:
     timeline = build_day_timeline(day)
     if not timeline:
         return []
     scheduled: list[dict] = []
-    current_minutes = day_start_minutes(day)
-    end_limit = day_end_minutes(day)
+    current_minutes = day_start_minutes(day, youth_timing)
+    end_limit = day_end_minutes(day, youth_timing)
 
     for index, node in enumerate(timeline):
         if index > 0:
@@ -197,6 +221,23 @@ def build_scheduled_day_timeline(day: Any) -> list[dict]:
             current_minutes = max(current_minutes, LUNCH_START_MINUTES)
         elif node["kind"] == "dinner":
             current_minutes = max(current_minutes, DINNER_START_MINUTES)
+        elif node["kind"] == "spot":
+            # Respect spot opening hours - shift start time if needed
+            spot = node.get("_spot") or node.get("spot")
+            if spot:
+                window = str(getattr(spot, "opening_hours", "") or "").strip()
+                if window and "-" in window:
+                    parts = window.split("-", 1)
+                    open_min = parse_clock(parts[0])
+                    close_min = parse_clock(parts[1]) if len(parts) == 2 else None
+                    if open_min is not None and current_minutes < open_min:
+                        current_minutes = open_min
+                    if close_min is not None:
+                        avail = close_min - current_minutes
+                        if avail < 30:
+                            current_minutes = max(DEFAULT_DAY_START_MINUTES, close_min - 90)
+                            notes = node.get("notes", [])
+                            notes.append(f"景点{getattr(spot, 'name', '')}即将闭园（窗口不足），已调整至合适时间。")
 
         duration_minutes = node_duration_minutes(node)
         start_minutes = current_minutes
@@ -205,7 +246,13 @@ def build_scheduled_day_timeline(day: Any) -> list[dict]:
         enriched["start_time"] = format_minutes(start_minutes)
         enriched["end_time"] = format_minutes(end_minutes)
         enriched["duration_minutes"] = duration_minutes
-        enriched["time_window_ok"] = _node_time_window_ok(node["kind"], start_minutes)
+
+        if node["kind"] == "spot":
+            spot = node.get("_spot") or node.get("spot")
+            opening_ok = spot_opening_window_ok(spot, start_minutes, duration_minutes) if spot else True
+            enriched["time_window_ok"] = _node_time_window_ok(node["kind"], start_minutes) and opening_ok
+        else:
+            enriched["time_window_ok"] = _node_time_window_ok(node["kind"], start_minutes)
         enriched["day_end_buffer_ok"] = end_minutes <= end_limit
         scheduled.append(enriched)
         current_minutes = end_minutes
